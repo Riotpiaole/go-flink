@@ -11,34 +11,31 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
+	"riotpiaole.com/vec_db_pipeline/pipeline"
+	"riotpiaole.com/vec_db_pipeline/pipeline/datasource"
 )
 
 func main() {
 
-	// // Run the pipeline. You can specify your runner with the --runner flag.
-	// if err := beamx.Run(ctx, pipeline); err != nil {
-	// 	log.Fatalf("Failed to execute job: %v", err)
-	// }
-
 	var rootCmd = &cobra.Command{
 		Use:   "slogger [inputs...] processor.so",
 		Short: "Run an ETL process with given files and a shared object plugin",
-		Args:  cobra.MinimumNArgs(2),
+		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// The last argument is the .so file
-			processor := args[len(args)-1]
 
 			// Everything before the last argument is part of the input
-			inputs := args[:len(args)-1]
+			inputs := args[0]
 
 			fmt.Printf("🚀 Starting ETL Process\n")
 			fmt.Printf("📂 Inputs:    %v\n", inputs)
-			fmt.Printf("⚙️  Processor: %s\n", processor)
+			// fmt.Printf("⚙️  Processor: %s\n", processor)
 
 			// Logic to handle DB URL vs File Dir vs File List would go here
-			executeETL(inputs, processor)
+			RunPipeline(inputs)
 		},
 	}
 
@@ -46,4 +43,14 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+func RunPipeline(filePath string) {
+	datasource := datasource.FilesDataSource{
+		FilePath: filePath,
+	}
+	ppl := pipeline.NewPipeline(&datasource, 10, func(s string) string { return "" })
+	ppl.Start()
+
+	time.Sleep(1 * time.Second)
 }

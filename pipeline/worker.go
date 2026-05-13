@@ -1,6 +1,7 @@
 package pipeline
 
 type workerRole int
+type TaskStatus int
 
 const (
 	MAPPER workerRole = iota
