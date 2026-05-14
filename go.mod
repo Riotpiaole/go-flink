@@ -12,7 +12,10 @@ go 1.26.0
 
 replace riotpiaole.com/vec_db_pipeline => ../slogger
 
-require github.com/spf13/cobra v1.10.2
+require (
+	github.com/emirpasic/gods v1.18.1
+	github.com/spf13/cobra v1.10.2
+)
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

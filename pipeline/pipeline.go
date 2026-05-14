@@ -2,8 +2,7 @@ package pipeline
 
 import (
 	"context"
-
-	"context"
+	"time"
 
 	"riotpiaole.com/vec_db_pipeline/pipeline/datasource"
 )
@@ -23,7 +22,6 @@ var _ StreamListener = (*Pipeline)(nil)
 
 // FileDataSource handles directory ingestion
 type Pipeline struct {
-	Sources       datasource.DataSource
 	Sources       datasource.DataSource
 	Clusters      []Coordinator
 	WindowSize    int
@@ -67,7 +65,6 @@ func (p *Pipeline) Sink(sinkFunc func(string) error) error {
 
 // NewPipeline creates a new instance
 func NewPipeline(source datasource.DataSource, windowSize int, partitionFunc func(string) string) *Pipeline {
-func NewPipeline(source datasource.DataSource, windowSize int, partitionFunc func(string) string) *Pipeline {
 	return &Pipeline{
 		Sources:       source,
 		Clusters:      []Coordinator{}, // This can be populated with actual cluster addresses
@@ -84,5 +81,11 @@ func (p *Pipeline) Start() {
 	coordinator := NewCoordinator()
 
 	coordinator.ListenFromDataSource(msgCh)
+
 	coordinator.StartsServer()
+	for coordinator.Done() {
+		time.Sleep(time.Second)
+	}
+
+	time.Sleep(time.Second)
 }

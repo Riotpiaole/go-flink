@@ -11,7 +11,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 	"riotpiaole.com/vec_db_pipeline/pipeline"
@@ -19,9 +18,8 @@ import (
 )
 
 func main() {
-
 	var rootCmd = &cobra.Command{
-		Use:   "slogger [inputs...] processor.so",
+		Use:   " [inputs...] processor.so",
 		Short: "Run an ETL process with given files and a shared object plugin",
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
@@ -39,6 +37,17 @@ func main() {
 		},
 	}
 
+	var workerCmd = &cobra.Command{
+		Use:   "worker",
+		Short: "Run a worker",
+		Args:  cobra.MinimumNArgs(0),
+		Run: func(cmd *cobra.Command, args []string) {
+			// _ := args[0]
+			pipeline.StartWorker()
+		},
+	}
+	rootCmd.AddCommand(workerCmd)
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -52,5 +61,4 @@ func RunPipeline(filePath string) {
 	ppl := pipeline.NewPipeline(&datasource, 10, func(s string) string { return "" })
 	ppl.Start()
 
-	time.Sleep(1 * time.Second)
 }
