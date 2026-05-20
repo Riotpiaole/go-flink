@@ -11,7 +11,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
+	"strconv"
 
+	"github.com/joho/godotenv"
+	"github.com/pbnjay/memory"
 	"github.com/spf13/cobra"
 	"riotpiaole.com/vec_db_pipeline/pipeline"
 	"riotpiaole.com/vec_db_pipeline/pipeline/datasource"
@@ -54,11 +58,49 @@ func main() {
 	}
 }
 
+// resolveNumWorkers determines how many goroutine workers to launch.
+//
+// Resolution order:
+//  1. NUM_WORKER in .env / process environment — user-supplied hard limit.
+//  2. Memory-bound fallback — derived from free RAM divided by the per-goroutine
+//     stack budget (4 KB).  If the result is still zero (extremely constrained
+//     host), NumCPU is used as a last-resort floor.
+func resolveNumWorkers() int {
+	// Each goroutine starts with a 4 KB stack; use that as the budget unit.
+	const bytesPerWorker = 4 * 1024
+
+	// L1: load .env into the process environment (no-op when file is absent).
+	_ = godotenv.Load()
+
+	// L1: user-specified value takes priority over any automatic calculation.
+	if raw := os.Getenv("NUM_WORKER"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err == nil && n > 0 {
+			fmt.Printf("NUM_WORKER from env: %d\n", n)
+			return n
+		}
+		// Value is present but malformed — warn and fall through to the resource-based path.
+		fmt.Fprintf(os.Stderr, "invalid NUM_WORKER=%q, falling back to memory-bound calculation\n", raw)
+	}
+
+	// Fallback: compute from available RAM so we never over-commit goroutines.
+	free := memory.FreeMemory()
+	NUM_WORKER := int(free / bytesPerWorker)
+
+	// Guard against NUM_WORKER == 0 on a heavily loaded or very small host.
+	if NUM_WORKER < 1 {
+		NUM_WORKER = runtime.NumCPU()
+	}
+
+	fmt.Printf("NUM_WORKER (memory-bound): %d  (free RAM: %d MB)\n", NUM_WORKER, free/1024/1024)
+	return NUM_WORKER
+}
+
 func RunPipeline(filePath string) {
+	numWorkers := resolveNumWorkers()
 	datasource := datasource.FilesDataSource{
 		FilePath: filePath,
 	}
-	ppl := pipeline.NewPipeline(&datasource, 10, func(s string) string { return "" })
+	ppl := pipeline.NewPipeline(&datasource, numWorkers, func(s string) string { return "" })
 	ppl.Start()
-
 }
