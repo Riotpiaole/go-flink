@@ -51,7 +51,7 @@ type TaskType int
 const (
 	MapTask TaskType = iota
 	ReduceTask
-	GroupTask
+	SelectKeyTask
 	FilterTask
 	SinkTask
 )
