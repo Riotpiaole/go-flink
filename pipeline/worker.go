@@ -63,7 +63,6 @@ func StartWorker(id int, actions []StreamProcessAction, outputDir string) {
 			fmt.Printf("[worker %d] shutting down\n", w.ID)
 			return
 		default:
-			// Map/Reduce report TaskFailed directly on error; only send TaskSuccess on clean exit.
 			if w.invoke(reply) == nil {
 				w.CallForStatusReport(TaskSuccess, reply.TaskID, reply.TaskName, reply.PhaseIdx)
 			}
@@ -72,8 +71,6 @@ func StartWorker(id int, actions []StreamProcessAction, outputDir string) {
 }
 
 // invoke sets the active task context and dispatches to Map or Reduce.
-// Each method reports TaskFailed to the coordinator on error and sets w.lastErr.
-// invoke returns w.lastErr so StartWorker knows whether to send TaskSuccess.
 func (w *Worker) invoke(reply *MessageReply) error {
 	w.activeReply = reply
 	w.lastErr = nil
@@ -90,9 +87,6 @@ func (w *Worker) invoke(reply *MessageReply) error {
 }
 
 // Map implements StreamProcess.
-// Fetches the pre-chunked content from the coordinator via GetChunk RPC,
-// applies mapFunc, and writes intermediate KV pairs to disk.
-// On error it notifies the coordinator of TaskFailed and sets w.lastErr.
 func (w *Worker) Map(mapFunc StreamProcessAction) []KeyValue {
 	kvs, err := w.mapErr(mapFunc)
 	if err != nil {
@@ -155,9 +149,6 @@ func (w *Worker) getChunk(chunkID string) ([]byte, error) {
 }
 
 // Reduce implements StreamProcess.
-// It reads all mr-*-*-{BucketID} files, sorts and groups by key, applies reduceFunc
-// to each group, and writes the output to mr-out-{BucketID}.
-// On error it notifies the coordinator of TaskFailed and sets w.lastErr.
 func (w *Worker) Reduce(reduceFunc StreamProcessAction) any {
 	out, err := w.reduceErr(reduceFunc)
 	if err != nil {
@@ -171,7 +162,6 @@ func (w *Worker) Reduce(reduceFunc StreamProcessAction) any {
 
 func (w *Worker) reduceErr(reduceFunc StreamProcessAction) ([]KeyValue, error) {
 	reply := w.activeReply
-	// TaskName is the ChunkID for reduce tasks; use it to locate map outputs.
 	chunkID := reply.TaskName
 	outPath := filepath.Join(w.outputDir, fmt.Sprintf("mr-out-%s", chunkID))
 
@@ -242,7 +232,6 @@ func (w *Worker) Sink(sinkFunc StreamProcessAction) error {
 	panic("unimplemented")
 }
 
-// buildRing creates a consistent hash ring over nReduce bucket node names.
 func buildRing(nReduce int) *hashring.HashRing {
 	nodes := make([]string, nReduce)
 	for i := range nodes {

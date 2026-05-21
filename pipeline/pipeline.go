@@ -26,7 +26,6 @@ var _ StreamListener = (*Pipeline)(nil)
 type Pipeline struct {
 	Sources   datasource.DataSource
 	Actions   []StreamProcessAction
-	NumWorker int
 	NReduce   int
 	OutputDir string
 }
@@ -42,12 +41,10 @@ func (p *Pipeline) ListenRawBytes(source <-chan []byte) {
 }
 
 // NewPipeline creates a new instance
-func NewPipeline(source datasource.DataSource, numWorkers int) *Pipeline {
+func NewPipeline(source datasource.DataSource) *Pipeline {
 	return &Pipeline{
 		Sources:   source,
-		NumWorker: numWorkers,
 		Actions:   []StreamProcessAction{},
-		NReduce:   2 * numWorkers,
 		OutputDir: DefaultOutputDir,
 	}
 }
@@ -95,14 +92,6 @@ func (p *Pipeline) Start() {
 
 	go coordinator.Start(msgCh)
 	fmt.Printf("[pipeline] coordinator started (nReduce=%d, phases=%d)\n", p.NReduce, len(p.Actions))
-
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		for workerId := range p.NumWorker {
-			go StartWorker(workerId, p.Actions, p.OutputDir)
-		}
-		fmt.Printf("[pipeline] %d workers started\n", p.NumWorker)
-	}()
 
 	for !coordinator.Done() {
 		time.Sleep(time.Second)

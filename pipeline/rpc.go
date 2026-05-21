@@ -48,13 +48,13 @@ type MessageReply struct {
 	MsgType     MsgType
 	NReduce     int
 	TaskID      int
-	TaskName    string // file path for phase 0 (map)
-	FileName    string // base file name of the source chunk
+	TaskName    string   // file path for phase 0 (map)
+	FileName    string   // base file name of the source chunk
 	ChunkID     string // UUID identifying this specific file chunk
 	BucketID    int    // partition index for phase 1+ (reduce, etc.)
-	ActionIndex int    // index into worker's actions slice
-	PhaseIdx    int    // coordinator's current phaseIdx at dispatch time
-	ChunkOffset int64  // byte offset where this map task should begin reading
+	ActionIndex int      // index into coordinator's ProcessAction slice (kept for phase tracking)
+	PhaseIdx    int      // coordinator's current phaseIdx at dispatch time
+	ChunkOffset int64    // byte offset where this map task should begin reading
 }
 
 // ChunkRequest is sent from worker → coordinator to fetch raw chunk content.

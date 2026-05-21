@@ -7,19 +7,67 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
-const ChunkSize = 100 * 1024 * 1024 // 100 MB
+const ChunkSize = 10 * 1024 * 1024 // 10 MB
 
-// FileChunk carries the original file name and up to 100 MB of its content.
+// FileChunk carries the original file name and up to 10 MB of its content.
 type FileChunk struct {
 	FileName string
 	Content  []byte
 }
 
+// ChunkQueue is a thread-safe non-blocking FIFO for FileChunk items.
+// Producers call Push then Close; consumers call Pop until Done returns true.
+type ChunkQueue struct {
+	mu     sync.Mutex
+	items  []FileChunk
+	closed bool
+}
+
+func NewChunkQueue() *ChunkQueue { return &ChunkQueue{} }
+
+func (q *ChunkQueue) Push(c FileChunk) {
+	q.mu.Lock()
+	q.items = append(q.items, c)
+	q.mu.Unlock()
+}
+
+// Pop returns the next item and true, or zero-value and false if the queue is empty.
+func (q *ChunkQueue) Pop() (FileChunk, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) == 0 {
+		return FileChunk{}, false
+	}
+	item := q.items[0]
+	q.items = q.items[1:]
+	return item, true
+}
+
+// Close signals that no more items will be pushed.
+func (q *ChunkQueue) Close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+}
+
+// Done returns true when the producer has closed the queue and all items have been consumed.
+func (q *ChunkQueue) Done() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed && len(q.items) == 0
+}
+
+func (q *ChunkQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
 type DataSource interface {
-	Stream(ctx context.Context) <-chan string
-	StreamChunks(ctx context.Context) <-chan FileChunk
+	StreamChunks(ctx context.Context) *ChunkQueue
 }
 
 var _ DataSource = (*FilesDataSource)(nil)
@@ -28,11 +76,12 @@ type FilesDataSource struct {
 	FilePath string
 }
 
-// Stream implements DataSource.
-func (fd *FilesDataSource) Stream(ctx context.Context) <-chan string {
-	jobs := make(chan string)
+// StreamChunks walks the directory and pushes each file in up to 100 MB chunks
+// into a ChunkQueue. The queue is closed when all files have been enqueued.
+func (fd *FilesDataSource) StreamChunks(ctx context.Context) *ChunkQueue {
+	q := NewChunkQueue()
 	go func() {
-		defer close(jobs)
+		defer q.Close()
 		err := filepath.WalkDir(fd.FilePath, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -40,35 +89,8 @@ func (fd *FilesDataSource) Stream(ctx context.Context) <-chan string {
 			if d.IsDir() {
 				return nil
 			}
-			select {
-			case jobs <- path:
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return ctx.Err()
-			}
-			return nil
-		})
-		if err != nil {
-			fmt.Printf("failed to walk directory: %s\n", err)
-		}
-	}()
-	return jobs
-}
-
-// StreamChunks implements DataSource. It walks the directory and emits each file
-// in up to 100 MB chunks. Each FileChunk carries the full file path and its content.
-func (fd *FilesDataSource) StreamChunks(ctx context.Context) <-chan FileChunk {
-	ch := make(chan FileChunk)
-	go func() {
-		defer close(ch)
-		err := filepath.WalkDir(fd.FilePath, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
 			}
 
 			f, err := os.Open(path)
@@ -87,11 +109,7 @@ func (fd *FilesDataSource) StreamChunks(ctx context.Context) <-chan FileChunk {
 				if n > 0 {
 					chunk := make([]byte, n)
 					copy(chunk, buf[:n])
-					select {
-					case ch <- FileChunk{FileName: path, Content: chunk}:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+					q.Push(FileChunk{FileName: path, Content: chunk})
 				}
 				if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 					break
@@ -107,5 +125,5 @@ func (fd *FilesDataSource) StreamChunks(ctx context.Context) <-chan FileChunk {
 			fmt.Printf("failed to walk directory: %s\n", err)
 		}
 	}()
-	return ch
+	return q
 }

@@ -2,3 +2,6 @@
 mr-out
 .vscode
 test/
+
+*.so
+vec_db_pipeline

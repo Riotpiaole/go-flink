@@ -317,7 +317,7 @@ func (c *Coordinator) nextJob() (*TaskInfo, bool) {
 	return item.(*TaskInfo), false
 }
 
-func (c *Coordinator) Start(msgChan <-chan datasource.FileChunk) {
+func (c *Coordinator) Start(q *datasource.ChunkQueue) {
 	rpc.Register(c)
 	rpc.HandleHTTP()
 	sockname := coordinatorSock()
@@ -327,7 +327,7 @@ func (c *Coordinator) Start(msgChan <-chan datasource.FileChunk) {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
-	go c.listenFromDataSource(msgChan)
+	go c.listenFromDataSource(q)
 	go c.runSweeper()
 	time.Sleep(30 * time.Millisecond)
 }
@@ -344,10 +344,15 @@ func (c *Coordinator) runSweeper() {
 	}
 }
 
-func (c *Coordinator) listenFromDataSource(msgCh <-chan datasource.FileChunk) {
+func (c *Coordinator) listenFromDataSource(q *datasource.ChunkQueue) {
 	fmt.Println("[coordinator] listening from data source")
 	idx := 0
-	for chunk := range msgCh {
+	for !q.Done() {
+		chunk, ok := q.Pop()
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		chunkID := uuid.New().String()
 		c.mu.Lock()
 		c.chunkStore[chunkID] = chunk.Content
