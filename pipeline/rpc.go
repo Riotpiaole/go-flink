@@ -49,10 +49,22 @@ type MessageReply struct {
 	NReduce     int
 	TaskID      int
 	TaskName    string // file path for phase 0 (map)
+	FileName    string // base file name of the source chunk
+	ChunkID     string // UUID identifying this specific file chunk
 	BucketID    int    // partition index for phase 1+ (reduce, etc.)
 	ActionIndex int    // index into worker's actions slice
 	PhaseIdx    int    // coordinator's current phaseIdx at dispatch time
 	ChunkOffset int64  // byte offset where this map task should begin reading
+}
+
+// ChunkRequest is sent from worker → coordinator to fetch raw chunk content.
+type ChunkRequest struct {
+	ChunkID string
+}
+
+// ChunkReply carries the raw bytes of a chunk back to the requesting worker.
+type ChunkReply struct {
+	Content []byte
 }
 
 // KeyValue is the fundamental unit exchanged between map and reduce workers.

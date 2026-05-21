@@ -2,9 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -15,10 +13,6 @@ import (
 
 	"github.com/serialx/hashring"
 )
-
-var errContinue = errors.New("task continuation in progress")
-
-const chunkSize = 5 * 1024 * 1024 // 100 MB
 
 type Worker struct {
 	ID          int
@@ -96,18 +90,16 @@ func (w *Worker) invoke(reply *MessageReply) error {
 }
 
 // Map implements StreamProcess.
+// Fetches the pre-chunked content from the coordinator via GetChunk RPC,
+// applies mapFunc, and writes intermediate KV pairs to disk.
 // On error it notifies the coordinator of TaskFailed and sets w.lastErr.
-// When a chunk is complete but more file data remains, it sends TaskContinue and
-// sets w.lastErr = errContinue so invoke skips the TaskSuccess call.
 func (w *Worker) Map(mapFunc StreamProcessAction) []KeyValue {
 	kvs, err := w.mapErr(mapFunc)
-	if err != nil && !errors.Is(err, errContinue) {
+	if err != nil {
 		w.lastErr = err
 		reply := w.activeReply
 		fmt.Printf("[worker %d] map task %d failed: %v\n", w.ID, reply.TaskID, err)
 		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
-	} else if errors.Is(err, errContinue) {
-		w.lastErr = errContinue
 	}
 	return kvs
 }
@@ -115,50 +107,27 @@ func (w *Worker) Map(mapFunc StreamProcessAction) []KeyValue {
 func (w *Worker) mapErr(mapFunc StreamProcessAction) ([]KeyValue, error) {
 	reply := w.activeReply
 
-	f, err := os.Open(reply.TaskName)
+	content, err := w.getChunk(reply.ChunkID)
 	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	if reply.ChunkOffset > 0 {
-		if _, err := f.Seek(reply.ChunkOffset, io.SeekStart); err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("fetch chunk %s: %w", reply.ChunkID, err)
 	}
 
-	buf := make([]byte, chunkSize)
-	n, readErr := io.ReadFull(f, buf)
-	if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-		return nil, readErr
-	}
-	data := buf[:n]
-	// ReadFull returns nil only when it filled the buffer — meaning there may be more.
-	hasMore := readErr == nil
-
-	ring := buildRing(reply.NReduce)
-	taskBase := filepath.Base(reply.TaskName)
-	offset := reply.ChunkOffset
-
-	checkpointGlob := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-%d-*", taskBase, offset))
+	checkpointGlob := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-*", reply.ChunkID))
 	existing, _ := filepath.Glob(checkpointGlob)
 	if len(existing) > 0 {
-		fmt.Printf("[worker %d] map task %s offset %d: checkpoint found, skipping\n",
-			w.ID, taskBase, offset)
-		if hasMore {
-			w.callForContinuation(offset+int64(n), reply.TaskID, reply.TaskName, reply.PhaseIdx)
-			return nil, errContinue
-		}
+		fmt.Printf("[worker %d] map task %s: checkpoint found, skipping\n", w.ID, reply.ChunkID)
 		return nil, nil
 	}
 
-	result := mapFunc.Action(reply.TaskName, string(data))
+	result := mapFunc.Action(reply.FileName, string(content))
 	kvs, ok := result.([]KeyValue)
 	if !ok {
 		return nil, fmt.Errorf("map action must return []KeyValue, got %T", result)
 	}
-	bucketStr, _ := ring.GetNode(strconv.FormatInt(offset, 10))
-	path := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-%d-%s", taskBase, offset, bucketStr))
+
+	ring := buildRing(reply.NReduce)
+	bucketStr, _ := ring.GetNode(reply.ChunkID)
+	path := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-%s", reply.ChunkID, bucketStr))
 	out, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -171,25 +140,18 @@ func (w *Worker) mapErr(mapFunc StreamProcessAction) ([]KeyValue, error) {
 		}
 	}
 	out.Close()
-	fmt.Printf("[worker %d] map task %s offset %d → %s (%d kv pairs)\n",
-		w.ID, taskBase, offset, path, len(kvs))
-
-	if hasMore {
-		w.callForContinuation(offset+int64(n), reply.TaskID, reply.TaskName, reply.PhaseIdx)
-		return kvs, errContinue
-	}
+	fmt.Printf("[worker %d] map %s (%s) → %s (%d kv pairs)\n",
+		w.ID, reply.FileName, reply.ChunkID, path, len(kvs))
 	return kvs, nil
 }
 
-func (w *Worker) callForContinuation(nextOffset int64, taskId int, taskName string, phaseIdx int) bool {
-	args := MessageSend{
-		MsgType:    TaskContinue,
-		TaskID:     taskId,
-		TaskName:   taskName,
-		PhaseIdx:   phaseIdx,
-		NextOffset: nextOffset,
+func (w *Worker) getChunk(chunkID string) ([]byte, error) {
+	req := ChunkRequest{ChunkID: chunkID}
+	reply := ChunkReply{}
+	if !call("Coordinator.GetChunk", &req, &reply) {
+		return nil, fmt.Errorf("RPC GetChunk failed for chunk %s", chunkID)
 	}
-	return call("Coordinator.NoticeResult", &args, &MessageReply{})
+	return reply.Content, nil
 }
 
 // Reduce implements StreamProcess.
@@ -209,17 +171,16 @@ func (w *Worker) Reduce(reduceFunc StreamProcessAction) any {
 
 func (w *Worker) reduceErr(reduceFunc StreamProcessAction) ([]KeyValue, error) {
 	reply := w.activeReply
-	taskBase := filepath.Base(reply.TaskName)
-	outPath := filepath.Join(w.outputDir, fmt.Sprintf("mr-out-%s", taskBase))
+	// TaskName is the ChunkID for reduce tasks; use it to locate map outputs.
+	chunkID := reply.TaskName
+	outPath := filepath.Join(w.outputDir, fmt.Sprintf("mr-out-%s", chunkID))
 
-	// Checkpoint: output file already exists means this task completed.
 	if _, err := os.Stat(outPath); err == nil {
-		fmt.Printf("[worker %d] reduce task %s: checkpoint found, skipping\n", w.ID, taskBase)
+		fmt.Printf("[worker %d] reduce task %s: checkpoint found, skipping\n", w.ID, chunkID)
 		return nil, nil
 	}
 
-	// Stream-decode all intermediate KV pairs produced by this map task.
-	pattern := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-*-*", taskBase))
+	pattern := filepath.Join(w.outputDir, fmt.Sprintf("mr-%s-*", chunkID))
 	files, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
@@ -266,7 +227,8 @@ func (w *Worker) reduceErr(reduceFunc StreamProcessAction) ([]KeyValue, error) {
 		i = j
 	}
 
-	fmt.Printf("[worker %d] reduce task %s → %s (%d results)\n", w.ID, taskBase, outPath, len(out))
+	fmt.Printf("[worker %d] reduce %s (%s) → %s (%d results)\n",
+		w.ID, reply.FileName, chunkID, outPath, len(out))
 	return out, nil
 }
 

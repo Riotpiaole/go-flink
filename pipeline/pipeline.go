@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -89,16 +90,18 @@ func (p *Pipeline) Start() {
 
 	ctx := context.Background()
 
-	msgCh := p.Sources.Stream(ctx)
+	msgCh := p.Sources.StreamChunks(ctx)
 	coordinator := NewCoordinator(p.NReduce, p.Actions)
 
 	go coordinator.Start(msgCh)
+	fmt.Printf("[pipeline] coordinator started (nReduce=%d, phases=%d)\n", p.NReduce, len(p.Actions))
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		for workerId := range p.NumWorker {
 			go StartWorker(workerId, p.Actions, p.OutputDir)
 		}
+		fmt.Printf("[pipeline] %d workers started\n", p.NumWorker)
 	}()
 
 	for !coordinator.Done() {

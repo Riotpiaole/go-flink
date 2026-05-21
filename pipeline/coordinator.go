@@ -12,6 +12,8 @@ import (
 
 	pq "github.com/emirpasic/gods/queues/priorityqueue"
 	"github.com/emirpasic/gods/utils"
+	"github.com/google/uuid"
+	"riotpiaole.com/vec_db_pipeline/pipeline/datasource"
 )
 
 const (
@@ -22,6 +24,8 @@ const (
 
 type TaskInfo struct {
 	FilePath     string
+	FileName     string    // base name of the source file
+	ChunkID      string    // UUID identifying this specific 100 MB chunk
 	Status       TaskStatus
 	TaskId       int
 	PhaseIdx     int       // which phase this task belongs to
@@ -59,9 +63,14 @@ type Coordinator struct {
 	// Key = TaskId. Used to detect crashed workers via the timeout sweeper.
 	inFlight map[int]*TaskInfo
 
-	// taskFiles maps TaskId → source FilePath, populated during the map phase
-	// so reduce tasks can carry the same TaskName.
+	// taskFiles maps TaskId → ChunkID so reduce tasks reference the right map output files.
 	taskFiles map[int]string
+
+	// taskFileNames maps TaskId → original FileName for logging and worker display.
+	taskFileNames map[int]string
+
+	// chunkStore holds raw chunk content keyed by ChunkID (UUID).
+	chunkStore map[string][]byte
 
 	Intermediates *IntermediateStore
 }
@@ -82,6 +91,8 @@ func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 		JobStatus:     pq.NewWith(byPriority),
 		inFlight:      make(map[int]*TaskInfo),
 		taskFiles:     make(map[int]string),
+		taskFileNames: make(map[int]string),
+		chunkStore:    make(map[string][]byte),
 		Intermediates: NewIntermediateStore(nReduce),
 	}
 }
@@ -121,6 +132,8 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	reply.MsgType = TaskAlloc
 	reply.TaskID = task.TaskId
 	reply.TaskName = task.FilePath
+	reply.FileName = task.FileName
+	reply.ChunkID = task.ChunkID
 	reply.BucketID = task.TaskId
 	reply.NReduce = c.NReduce
 	reply.ActionIndex = c.phaseIdx
@@ -149,6 +162,9 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 	switch req.MsgType {
 	case TaskSuccess:
 		c.phaseDone++
+		if inflight && task.ChunkID != "" {
+			delete(c.chunkStore, task.ChunkID)
+		}
 		fmt.Printf("[coordinator] phase %d: task %d succeeded (%d/%d done)\n",
 			req.PhaseIdx, req.TaskID, c.phaseDone, c.phaseTotal())
 
@@ -171,6 +187,9 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 		task.Retries++
 		if task.Retries >= maxRetries {
 			c.failedTasks++
+			if task.ChunkID != "" {
+				delete(c.chunkStore, task.ChunkID)
+			}
 			fmt.Printf("[coordinator] phase %d: task %d exhausted %d retries — giving up\n",
 				req.PhaseIdx, req.TaskID, maxRetries)
 			// Count as done so the phase can still complete (with partial results).
@@ -184,6 +203,18 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 		}
 	}
 
+	return nil
+}
+
+// GetChunk implements TaskScheduler. Workers call this to retrieve raw chunk bytes by UUID.
+func (c *Coordinator) GetChunk(req *ChunkRequest, reply *ChunkReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	content, ok := c.chunkStore[req.ChunkID]
+	if !ok {
+		return fmt.Errorf("chunk %s not found", req.ChunkID)
+	}
+	reply.Content = content
 	return nil
 }
 
@@ -201,6 +232,9 @@ func (c *Coordinator) sweepTimedOutTasks() {
 			if task.Retries >= maxRetries {
 				c.failedTasks++
 				c.phaseDone++
+				if task.ChunkID != "" {
+					delete(c.chunkStore, task.ChunkID)
+				}
 				fmt.Printf("[coordinator] task %d timed out and exhausted retries — giving up\n", id)
 			} else {
 				task.Status = UnAssigned
@@ -237,11 +271,14 @@ func (c *Coordinator) transitionToNextPhase() {
 	case MapTask:
 		// tasks arrive dynamically from the data source — nothing to enqueue here
 	default:
-		// One reduce task per map task: workers glob mr-{TaskName}-*-* to find all chunks.
+		// One reduce task per map task: workers glob mr-{ChunkID}-* to find all map outputs.
 		for i := 0; i < c.NumTasks; i++ {
+			chunkID := c.taskFiles[i]
 			c.JobStatus.Enqueue(&TaskInfo{
 				TaskId:   i,
-				FilePath: c.taskFiles[i],
+				FilePath: chunkID,
+				FileName: c.taskFileNames[i],
+				ChunkID:  chunkID,
 				Status:   UnAssigned,
 				PhaseIdx: c.phaseIdx,
 			})
@@ -280,7 +317,7 @@ func (c *Coordinator) nextJob() (*TaskInfo, bool) {
 	return item.(*TaskInfo), false
 }
 
-func (c *Coordinator) Start(msgChan <-chan string) {
+func (c *Coordinator) Start(msgChan <-chan datasource.FileChunk) {
 	rpc.Register(c)
 	rpc.HandleHTTP()
 	sockname := coordinatorSock()
@@ -290,10 +327,9 @@ func (c *Coordinator) Start(msgChan <-chan string) {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
-	time.Sleep(30 * time.Millisecond)
-
 	go c.listenFromDataSource(msgChan)
 	go c.runSweeper()
+	time.Sleep(30 * time.Millisecond)
 }
 
 // runSweeper periodically re-enqueues tasks whose workers have gone silent.
@@ -308,22 +344,28 @@ func (c *Coordinator) runSweeper() {
 	}
 }
 
-func (c *Coordinator) listenFromDataSource(msgCh <-chan string) {
+func (c *Coordinator) listenFromDataSource(msgCh <-chan datasource.FileChunk) {
 	fmt.Println("[coordinator] listening from data source")
 	idx := 0
-	for msg := range msgCh {
+	for chunk := range msgCh {
+		chunkID := uuid.New().String()
 		c.mu.Lock()
+		c.chunkStore[chunkID] = chunk.Content
 		c.JobStatus.Enqueue(&TaskInfo{
-			FilePath: msg,
+			FilePath: chunkID,
+			FileName: chunk.FileName,
+			ChunkID:  chunkID,
 			Status:   UnAssigned,
 			TaskId:   idx,
 			PhaseIdx: 0,
 		})
-		c.taskFiles[idx] = msg
+		c.taskFiles[idx] = chunkID
+		c.taskFileNames[idx] = chunk.FileName
 		idx++
 		c.NumTasks++
 		c.mu.Unlock()
-		fmt.Printf("[coordinator] enqueued map task %d: %s\n", idx-1, msg)
+		fmt.Printf("[coordinator] enqueued map task %d: file=%s chunk=%s (%d bytes)\n",
+			idx-1, chunk.FileName, chunkID, len(chunk.Content))
 	}
 	c.mu.Lock()
 	c.sourceDone = true
