@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ type TaskInfo struct {
 	TaskId       int
 	PhaseIdx     int       // which phase this task belongs to
 	StageIdx     int       // same as PhaseIdx; carried into MessageReply for workers
+	ActionType   TaskType  // Map/Filter/Reduce/GroupBy/SelectKey/Sink — makes tasks self-describing
 	PluginName   string    // plugin to invoke for this task
 	Retries      int       // how many times this task has been retried
 	DispatchedAt time.Time // when it was last handed to a worker (zero = not dispatched)
@@ -77,6 +79,22 @@ type Coordinator struct {
 	// chunkStore holds raw chunk content keyed by ChunkID (UUID).
 	chunkStore map[string][]byte
 
+	// reduceDoneBuckets records which Reduce buckets have reported TaskSuccess.
+	// Compacters poll AskForCompactTask which reads this to dispatch GroupBy work
+	// reactively — as soon as a bucket finishes Reduce, its GroupBy can start.
+	reduceDoneBuckets map[int]bool
+
+	// compactDispatched records which GroupBy buckets have been sent to a Compacter.
+	// Prevents the same bucket being dispatched twice.
+	compactDispatched map[int]bool
+
+	// chunkDir is an optional on-disk fallback for chunk bytes (set by StartWithRaft).
+	// Allows a restarted leader to serve GetChunk without re-streaming the source.
+	// Note: does NOT help when a different pod becomes leader, since each pod has its
+	// own local disk. A shared PVC mount on the coordinator StatefulSet would be needed
+	// to cover that case.
+	chunkDir string
+
 	Intermediates *IntermediateStore
 
 	// raft is nil in single-node embedded mode; set by InitRaft for distributed operation.
@@ -107,9 +125,18 @@ func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 		inFlight:      make(map[int]*TaskInfo),
 		taskFiles:     make(map[int]string),
 		taskFileNames: make(map[int]string),
-		chunkStore:    make(map[string][]byte),
-		Intermediates: NewIntermediateStore(nReduce),
+		chunkStore:        make(map[string][]byte),
+		reduceDoneBuckets: make(map[int]bool),
+		compactDispatched: make(map[int]bool),
+		Intermediates:     NewIntermediateStore(nReduce),
 	}
+}
+
+func (c *Coordinator) chunkPath(chunkID string) string {
+	if c.chunkDir == "" {
+		return ""
+	}
+	return filepath.Join(c.chunkDir, chunkID+".bin")
 }
 
 // proposeCmd proposes a state mutation through Raft when distributed, or applies
@@ -251,13 +278,18 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	c.inFlight[task.TaskId] = task
 
 	action := c.ProcessAction[c.phaseIdx]
-	reply.MsgType        = TaskAlloc
-	reply.TaskID         = task.TaskId
-	reply.TaskName       = task.FilePath
-	reply.FileName       = task.FileName
-	reply.ChunkID        = task.ChunkID
-	reply.BucketID       = task.TaskId
-	reply.NReduce        = c.NReduce
+	reply.MsgType  = TaskAlloc
+	reply.TaskID   = task.TaskId
+	reply.TaskName = task.FilePath
+	reply.FileName = task.FileName
+	reply.ChunkID  = task.ChunkID
+	reply.NReduce  = c.NReduce
+	// BucketID is only meaningful for bucket-parallel phases (Reduce/GroupBy/SelectKey).
+	// For those phases transitionToNextPhase sets TaskId == bucket index, so reuse it.
+	switch action.ActionType {
+	case ReduceTask, GroupByTask, SelectKeyTask:
+		reply.BucketID = task.TaskId
+	}
 	reply.ActionIndex    = c.phaseIdx
 	reply.PhaseIdx       = c.phaseIdx
 	reply.ChunkOffset    = task.ChunkOffset
@@ -267,6 +299,96 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	reply.ActionType     = action.ActionType
 	reply.DispatchedAt   = now.UnixNano()
 	c.mu.Unlock()
+	return nil
+}
+
+// AskForCompactTask is the RPC endpoint for Compacter nodes. It serves GroupBy
+// tasks reactively (as reduce buckets complete) and Sink tasks from the regular
+// queue once the GroupBy phase advances to Sink.
+func (c *Coordinator) AskForCompactTask(req *MessageSend, reply *MessageReply) error {
+	if c.raftNode != nil && c.raftNode.State() != raft.Leader {
+		reply.MsgType = Wait
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.done() {
+		reply.MsgType = Shutdown
+		return nil
+	}
+
+	if c.phaseIdx >= len(c.ProcessAction) {
+		reply.MsgType = Wait
+		return nil
+	}
+
+	switch c.ProcessAction[c.phaseIdx].ActionType {
+	case GroupByTask:
+		action := c.ProcessAction[c.phaseIdx]
+		reducePhaseIdx := c.phaseIdx - 1
+		for bucket := 0; bucket < c.NReduce; bucket++ {
+			if c.reduceDoneBuckets[bucket] && !c.compactDispatched[bucket] {
+				c.compactDispatched[bucket] = true
+				now := time.Now()
+				task := &TaskInfo{
+					TaskId:       bucket,
+					ActionType:   GroupByTask,
+					StageIdx:     c.phaseIdx,
+					PhaseIdx:     c.phaseIdx,
+					PluginName:   action.Name,
+					DispatchedAt: now,
+				}
+				c.inFlight[bucket] = task
+				reply.MsgType       = TaskAlloc
+				reply.TaskID        = bucket
+				reply.BucketID      = bucket
+				reply.ActionType    = GroupByTask
+				reply.StageIdx      = c.phaseIdx
+				reply.InputStageIdx = reducePhaseIdx
+				reply.NReduce       = c.NReduce
+				reply.PluginName    = action.Name
+				reply.PhaseIdx      = c.phaseIdx
+				reply.DispatchedAt  = now.UnixNano()
+				return nil
+			}
+		}
+		reply.MsgType = Wait
+
+	case SinkTask:
+		// Sink tasks are pre-enqueued (one per bucket); drain them like AskForTask.
+		task, empty := c.nextJob()
+		if empty {
+			reply.MsgType = Wait
+			return nil
+		}
+		now := time.Now()
+		task.DispatchedAt = now
+		task.PhaseIdx = c.phaseIdx
+		c.inFlight[task.TaskId] = task
+
+		action := c.ProcessAction[c.phaseIdx]
+		// InputStageIdx = -1 signals Compacter to read mr-out-<bucket> (GroupBy output).
+		// Otherwise it reads mr-out-s<N>-<bucket> (Reduce output).
+		inputStageIdx := c.phaseIdx - 1
+		if inputStageIdx >= 0 && c.ProcessAction[inputStageIdx].ActionType == GroupByTask {
+			inputStageIdx = -1
+		}
+		reply.MsgType       = TaskAlloc
+		reply.TaskID        = task.TaskId
+		reply.BucketID      = task.TaskId
+		reply.ActionType    = SinkTask
+		reply.StageIdx      = c.phaseIdx
+		reply.InputStageIdx = inputStageIdx
+		reply.NReduce       = c.NReduce
+		reply.PluginName    = action.Name
+		reply.PhaseIdx      = c.phaseIdx
+		reply.DispatchedAt  = now.UnixNano()
+
+	default:
+		reply.MsgType = Wait
+	}
 	return nil
 }
 
@@ -316,6 +438,12 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 		return nil
 	}
 
+	// Capture ActionType before the lock is gone (task is already removed from inFlight).
+	var taskActionType TaskType
+	if inflight {
+		taskActionType = task.ActionType
+	}
+
 	// TaskSuccess and TaskFailed mutate phaseDone/retries — propose through Raft.
 	switch req.MsgType {
 	case TaskSuccess:
@@ -328,6 +456,11 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 			return err
 		}
 		c.mu.Lock()
+		// When a Reduce bucket completes, record it so AskForCompactTask can
+		// reactively dispatch the corresponding GroupBy task to a Compacter.
+		if taskActionType == ReduceTask {
+			c.reduceDoneBuckets[req.TaskID] = true
+		}
 		fmt.Printf("[coordinator] phase %d: task %d succeeded (%d/%d done)\n",
 			req.PhaseIdx, req.TaskID, c.phaseDone, c.phaseTotal())
 		c.mu.Unlock()
@@ -406,13 +539,27 @@ func (c *Coordinator) IsDone(req *JobSpec, reply *JobReply) error {
 // GetChunk implements TaskScheduler. Workers call this to retrieve raw chunk bytes by UUID.
 func (c *Coordinator) GetChunk(req *ChunkRequest, reply *ChunkReply) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	content, ok := c.chunkStore[req.ChunkID]
-	if !ok {
-		return fmt.Errorf("chunk %s not found", req.ChunkID)
+	c.mu.Unlock()
+
+	if ok && content != nil {
+		reply.Content = content
+		return nil
 	}
-	reply.Content = content
-	return nil
+
+	// Memory miss (nil placeholder on follower, or leader restarted) — try disk.
+	if path := c.chunkPath(req.ChunkID); path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			reply.Content = data
+			c.mu.Lock()
+			c.chunkStore[req.ChunkID] = data // warm the cache
+			c.mu.Unlock()
+			return nil
+		}
+	}
+
+	return fmt.Errorf("chunk %s not found", req.ChunkID)
 }
 
 // sweepTimedOutTasks re-enqueues any in-flight task that has exceeded taskTimeout.
@@ -431,6 +578,9 @@ func (c *Coordinator) sweepTimedOutTasks() {
 				c.phaseDone++
 				if task.ChunkID != "" {
 					delete(c.chunkStore, task.ChunkID)
+					if path := c.chunkPath(task.ChunkID); path != "" {
+						go os.Remove(path)
+					}
 				}
 				fmt.Printf("[coordinator] task %d timed out and exhausted retries — giving up\n", id)
 			} else {
@@ -503,11 +653,12 @@ func (c *Coordinator) transitionToNextPhase() {
 				Status:     UnAssigned,
 				PhaseIdx:   c.phaseIdx,
 				StageIdx:   c.phaseIdx,
+				ActionType: action.ActionType,
 				PluginName: action.Name,
 			}})
 		}
 
-	case ReduceTask, GroupByTask, SelectKeyTask:
+	case ReduceTask, SelectKeyTask:
 		for bucket := 0; bucket < nReduce; bucket++ {
 			_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
 				TaskId:     bucket,
@@ -515,19 +666,28 @@ func (c *Coordinator) transitionToNextPhase() {
 				Status:     UnAssigned,
 				PhaseIdx:   c.phaseIdx,
 				StageIdx:   c.phaseIdx,
+				ActionType: action.ActionType,
 				PluginName: action.Name,
 			}})
 		}
 
+	case GroupByTask:
+		// GroupBy tasks are not pre-enqueued. AskForCompactTask dispatches them
+		// reactively as reduce buckets complete (see reduceDoneBuckets).
+
 	case SinkTask:
-		_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
-			TaskId:     0,
-			FilePath:   "sink",
-			Status:     UnAssigned,
-			PhaseIdx:   c.phaseIdx,
-			StageIdx:   c.phaseIdx,
-			PluginName: action.Name,
-		}})
+		// One task per bucket so Compacters can parallelise the sink phase.
+		for bucket := 0; bucket < nReduce; bucket++ {
+			_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
+				TaskId:     bucket,
+				FilePath:   fmt.Sprintf("sink-bucket-%d", bucket),
+				Status:     UnAssigned,
+				PhaseIdx:   c.phaseIdx,
+				StageIdx:   c.phaseIdx,
+				ActionType: SinkTask,
+				PluginName: action.Name,
+			}})
+		}
 	}
 }
 
@@ -581,6 +741,13 @@ func (c *Coordinator) StartWithRaft(myRPCAddr string, peerRPCAddrs map[raft.Serv
 	c.peerRPCAddrs = peerRPCAddrs
 	c.workerRegistry = registry
 	c.workerOutputDir = outputDir
+
+	chunkDir := filepath.Join(outputDir, "chunks")
+	if err := os.MkdirAll(chunkDir, 0o755); err != nil {
+		log.Printf("[coordinator] warning: could not create chunk dir %s: %v — disk fallback disabled", chunkDir, err)
+	} else {
+		c.chunkDir = chunkDir
+	}
 
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -675,6 +842,13 @@ func (c *Coordinator) listenFromDataSource(q *datasource.ChunkQueue) {
 		c.chunkStore[chunkID] = chunk.Content
 		c.mu.Unlock()
 
+		// Also write to disk so a restarted leader can serve GetChunk from the same pod.
+		if path := c.chunkPath(chunkID); path != "" {
+			if err := os.WriteFile(path, chunk.Content, 0o644); err != nil {
+				fmt.Printf("[coordinator] warning: failed to persist chunk %s: %v\n", chunkID, err)
+			}
+		}
+
 		// Propose the task enqueue through Raft (no lock held).
 		_ = c.proposeCmd(RaftCommand{Type: CmdEnqueueTask, Task: &TaskInfo{
 			FilePath:   chunkID,
@@ -684,6 +858,7 @@ func (c *Coordinator) listenFromDataSource(q *datasource.ChunkQueue) {
 			TaskId:     idx,
 			PhaseIdx:   0,
 			StageIdx:   0,
+			ActionType: MapTask,
 			PluginName: phase0Plugin,
 		}})
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -78,6 +79,9 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 		delete(c.inFlight, cmd.TaskID)
 		if cmd.ChunkID != "" {
 			delete(c.chunkStore, cmd.ChunkID)
+			if path := c.chunkPath(cmd.ChunkID); path != "" {
+				go os.Remove(path) // async: avoid blocking Apply while holding mu
+			}
 		}
 		c.phaseDone++
 
@@ -100,6 +104,8 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 		c.phaseDone = 0
 		c.failedTasks = 0
 		c.inFlight = make(map[int]*TaskInfo)
+		c.reduceDoneBuckets = make(map[int]bool)
+		c.compactDispatched = make(map[int]bool)
 	}
 
 	return nil

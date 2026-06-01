@@ -68,13 +68,13 @@ Key responsibilities:
 
 The Raft log replicates coordinator metadata. Each log entry is a JSON-encoded `RaftCommand`:
 
-| Command | Effect on all nodes |
-|---|---|
-| `CmdEnqueueTask` | Add task to `JobStatus` queue; store nil placeholder in `chunkStore` on followers |
-| `CmdDispatchTask` | Record `DispatchedAt` timestamp in `inFlight` |
-| `CmdCompleteTask` | Remove from `inFlight`, increment `phaseDone`, evict chunk |
-| `CmdFailTask` | Remove from `inFlight`, increment retries; re-enqueue or count as done |
-| `CmdAdvancePhase` | Increment `phaseIdx`, reset `phaseDone` and `inFlight` |
+| Command             | Effect on all nodes                                                                |
+|---------------------|------------------------------------------------------------------------------------|
+| `CmdEnqueueTask`    | Add task to `JobStatus` queue; store nil placeholder in `chunkStore` on followers  |
+| `CmdDispatchTask`   | Record `DispatchedAt` timestamp in `inFlight`                                      |
+| `CmdCompleteTask`   | Remove from `inFlight`, increment `phaseDone`, evict chunk                         |
+| `CmdFailTask`       | Remove from `inFlight`, increment retries; re-enqueue or count as done             |
+| `CmdAdvancePhase`   | Increment `phaseIdx`, reset `phaseDone` and `inFlight`                             |
 
 `Snapshot` / `Restore` serialize `inFlight`, counters, `taskFiles`, and the queue contents so a new leader can resume without replaying the full log.
 
@@ -82,17 +82,17 @@ The Raft log replicates coordinator metadata. Each log entry is a JSON-encoded `
 
 Workers are stateless. Each task assignment (`MessageReply`) carries everything needed to execute it:
 
-| Field | Purpose |
-|---|---|
-| `PluginName` | Which `.so` to load (e.g. `"wc"`) |
-| `ActionType` | `MapTask` / `FilterTask` / `ReduceTask` / `GroupByTask` / `SinkTask` |
-| `StageIdx` | Current stage index — used to name output files (`mr-s<N>-…`) |
-| `InputStageIdx` | Stage whose output files are this task's inputs |
-| `ChunkID` | UUID of the raw chunk (for Map stage 0 only) |
-| `BucketID` | Consistent-hash bucket (for Reduce / GroupBy stages) |
-| `NReduce` | Total bucket count (for hashing in Map stages) |
-| `PhaseIdx` | Guards against stale reports after a sweeper re-dispatch |
-| `DispatchedAt` | Echoed back so the coordinator can reject stale `NoticeResult` calls |
+| Field            | Purpose                                                                      |
+|------------------|------------------------------------------------------------------------------|
+| `PluginName`     | Which `.so` to load (e.g. `"wc"`)                                            |
+| `ActionType`     | `MapTask` / `FilterTask` / `ReduceTask` / `GroupByTask` / `SinkTask`         |
+| `StageIdx`       | Current stage index — used to name output files (`mr-s<N>-…`)                |
+| `InputStageIdx`  | Stage whose output files are this task's inputs                              |
+| `ChunkID`        | UUID of the raw chunk (for Map stage 0 only)                                 |
+| `BucketID`       | Consistent-hash bucket (for Reduce / GroupBy stages)                         |
+| `NReduce`        | Total bucket count (for hashing in Map stages)                               |
+| `PhaseIdx`       | Guards against stale reports after a sweeper re-dispatch                     |
+| `DispatchedAt`   | Echoed back so the coordinator can reject stale `NoticeResult` calls         |
 
 Workers connect to the coordinator via TCP (`--coordinator host:port`) in distributed mode, or via Unix socket in embedded single-node mode.
 
@@ -263,15 +263,15 @@ Worker                              Coordinator (sweeper, every 5 s)
 
 ## Fault tolerance
 
-| Failure | Behaviour |
-|---|---|
-| Worker crashes mid-task | Sweeper detects silence after 30 s → re-enqueues (up to 3 retries) |
-| Worker returns TaskFailed | Re-enqueued immediately via Raft log |
-| Leader crashes | Raft elects new leader; new leader resumes from replicated `inFlight` + queue |
-| Stale report after sweeper re-dispatch | Rejected by `DispatchedAt` token mismatch in `NoticeResult` |
-| Stale report from old phase | Rejected by `PhaseIdx` guard |
-| Task exhausts retries | Counted as done (partial results), pipeline continues |
-| Duplicate map output | Workers detect existing checkpoint file and skip re-execution |
+| Failure                                | Behaviour                                                                     |
+|----------------------------------------|-------------------------------------------------------------------------------|
+| Worker crashes mid-task                | Sweeper detects silence after 30 s → re-enqueues (up to 3 retries)            |
+| Worker returns TaskFailed              | Re-enqueued immediately via Raft log                                          |
+| Leader crashes                         | Raft elects new leader; new leader resumes from replicated `inFlight` + queue |
+| Stale report after sweeper re-dispatch | Rejected by `DispatchedAt` token mismatch in `NoticeResult`                   |
+| Stale report from old phase            | Rejected by `PhaseIdx` guard                                                  |
+| Task exhausts retries                  | Counted as done (partial results), pipeline continues                         |
+| Duplicate map output                   | Workers detect existing checkpoint file and skip re-execution                 |
 
 ---
 
@@ -283,7 +283,7 @@ k8s/
 ├── rpc-service.yaml          # ClusterIP — load-balanced worker RPC access (go-flink-rpc:8000)
 ├── statefulset.yaml          # 3 coordinator pods (Raft consensus + task scheduling)
 ├── worker-deployment.yaml    # 3 worker pods (stateless, scale freely)
-├── kafka.yaml                # Single-node Kafka in KRaft mode (dev/minikube)
+├── kafka.yaml                # Kafka KRaft (apache/kafka:4.0.0): kafka-headless (clusterIP: None) + kafka ClusterIP + StatefulSet
 ├── output-pvc-minikube.yaml  # ReadWriteMany hostPath PV — shared intermediate files
 ├── plugins-pvc-minikube.yaml # ReadWriteOnce — plugin .so volume
 └── plugins-pvc.yaml          # ReadWriteMany variant for production
@@ -292,6 +292,8 @@ k8s/
 **Coordinator StatefulSet** — Raft only. No plugin directory, no output volume. Reads input via DataSource on leader. Raft WAL stored in per-pod PVC at `/data/raft`.
 
 **Worker Deployment** — stateless, scales independently. Init container copies bundled plugins from the image into the shared plugins PVC. Workers mount both the plugins PVC and the shared output PVC.
+
+**Kafka (KRaft)** — single-node `apache/kafka:4.0.0` StatefulSet, no ZooKeeper. `kafka-headless` (`clusterIP: None`) gives `kafka-0.kafka-headless` stable DNS required by `KAFKA_CONTROLLER_QUORUM_VOTERS`. `kafka` ClusterIP service exposes port 9092 for in-cluster producers and consumers.
 
 **Shared output** — `ReadWriteMany` PVC backed by a hostPath PV on minikube (single-node; all pods on the same node). On multi-node clusters, replace with NFS, EFS, or Azure File.
 

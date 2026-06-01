@@ -1,0 +1,62 @@
+## Compacter pool — handles GroupBy (compaction) and Sink tasks.
+## Compacters poll AskForCompactTask on the coordinator and start GroupBy
+## for each bucket as soon as its Reduce output is ready, overlapping
+## compaction with the tail of the Reduce phase.
+## Scale independently: kubectl scale deployment go-flink-compacter --replicas=N
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-flink-compacter
+  labels:
+    app: go-flink-compacter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: go-flink-compacter
+  template:
+    metadata:
+      labels:
+        app: go-flink-compacter
+    spec:
+      initContainers:
+      - name: init-plugins
+        image: goflink:v1.0.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "cp -rn /plugins/. /mnt/plugins/"]
+        volumeMounts:
+        - name: plugins
+          mountPath: /mnt/plugins
+      containers:
+      - name: compacter
+        image: goflink:v1.0.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - /usr/local/bin/go-flink
+        - -o=/data/output
+        - compacter
+        - --coordinator=go-flink-rpc:8000
+        - --plugin-dir=/plugins
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MONGO_URI
+          valueFrom:
+            secretKeyRef:
+              name: pipeline-secrets
+              key: mongo-uri
+              optional: true
+        volumeMounts:
+        - name: plugins
+          mountPath: /plugins
+        - name: output
+          mountPath: /data/output
+      volumes:
+      - name: plugins
+        persistentVolumeClaim:
+          claimName: go-flink-plugins
+      - name: output
+        persistentVolumeClaim:
+          claimName: go-flink-output    # ReadWriteMany — shared with worker pods

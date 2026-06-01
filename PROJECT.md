@@ -6,13 +6,13 @@ Distributed stream-processing engine (Go) with MapReduce-over-plugins, Raft cons
 
 ## Layer Status
 
-| Layer | Status | Note |
-|-------|--------|------|
-| 1 — Ingestion / MapReduce | ~55% | Core done; operators + Kafka source outstanding |
-| 2 — Write Path & Storage | 0% | Not started |
-| 3 — Table Catalog | 0% | Not started |
-| 4 — Distributed Query Engine | 0% | Not started |
-| 5 — Serving Layer | 0% | Not started |
+| Layer                        | Status | Note                                            |
+|------------------------------|--------|-------------------------------------------------|
+| 1 — Ingestion / MapReduce    | ~55%   | Core done; operators + Kafka source outstanding |
+| 2 — Write Path & Storage     | 0%     | Not started                                     |
+| 3 — Table Catalog            | 0%     | Not started                                     |
+| 4 — Distributed Query Engine | 0%     | Not started                                     |
+| 5 — Serving Layer            | 0%     | Not started                                     |
 
 ---
 

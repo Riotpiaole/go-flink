@@ -95,7 +95,7 @@ type FilesDataSource struct {
 	FilePath string
 }
 
-// StreamChunks walks the directory and pushes each file in up to 100 MB chunks
+// StreamChunks walks the directory and pushes each file in up to 10 MB chunks
 // into a ChunkQueue. The queue is closed when all files have been enqueued.
 func (fd *FilesDataSource) StreamChunks(ctx context.Context) *ChunkQueue {
 	q := NewChunkQueue()

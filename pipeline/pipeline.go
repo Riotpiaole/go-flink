@@ -75,8 +75,12 @@ func (p *Pipeline) Filter(pluginName string) *Pipeline {
 	return p
 }
 
-// GroupBy appends a groupby stage using the named plugin.
+// GroupBy appends a compaction stage that folds all staged reduce outputs for
+// each bucket into a single mr-out-<bucket> file. Must immediately follow a Reduce stage.
 func (p *Pipeline) GroupBy(pluginName string) *Pipeline {
+	if len(p.Actions) == 0 || p.Actions[len(p.Actions)-1].ActionType != ReduceTask {
+		panic("GroupBy must immediately follow a Reduce stage")
+	}
 	p.Actions = append(p.Actions, StreamProcessAction{
 		Name:       pluginName,
 		ActionType: GroupByTask,

@@ -175,7 +175,32 @@ func main() {
 	nodeCmd.Flags().StringVar(&nodeDataDir, "data-dir", "./raft-data", "directory for Raft WAL and snapshots")
 	nodeCmd.Flags().StringVar(&nodeKafkaBrokers, "kafka-brokers", "", "comma-separated Kafka broker addresses (reserved for Kafka task queue, not yet active)")
 
-	rootCmd.AddCommand(runCmd, workerCmd, submitCmd, nodeCmd)
+	// compacter subcommand: dedicated pool for GroupBy (compaction) and Sink tasks
+	var compacterID int
+	var compacterPluginDir string
+	var compacterCoordinatorAddr string
+
+	compacterCmd := &cobra.Command{
+		Use:   "compacter",
+		Short: "Start a Compacter that handles GroupBy and Sink tasks",
+		Run: func(cmd *cobra.Command, args []string) {
+			registry := pipeline.NewPluginRegistry(compacterPluginDir)
+			fmt.Printf("[compacter %d] started, plugin-dir=%s output=%s coordinator=%s\n",
+				compacterID, compacterPluginDir, outputDir, compacterCoordinatorAddr)
+			if compacterCoordinatorAddr != "" {
+				pipeline.StartCompacterRemote(compacterID, registry, outputDir, compacterCoordinatorAddr)
+			} else {
+				pipeline.StartCompacter(compacterID, registry, outputDir)
+			}
+		},
+	}
+	compacterCmd.Flags().IntVar(&compacterID, "id", os.Getpid(), "compacter ID")
+	compacterCmd.Flags().StringVar(&compacterPluginDir, "plugin-dir", "./plugins",
+		"directory containing .so plugins (needed for GroupBy Reduce calls)")
+	compacterCmd.Flags().StringVar(&compacterCoordinatorAddr, "coordinator", "",
+		"coordinator RPC address (host:port); empty = embedded Unix socket mode")
+
+	rootCmd.AddCommand(runCmd, workerCmd, submitCmd, nodeCmd, compacterCmd)
 	rootCmd.PersistentFlags().StringVarP(&outputDir, "output", "o", defaultOutputDir(),
 		"directory for intermediate and output files")
 

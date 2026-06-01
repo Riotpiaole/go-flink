@@ -1,8 +1,6 @@
 package pipeline
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/rpc"
@@ -10,13 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/serialx/hashring"
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	mongoopts "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type Worker struct {
@@ -109,23 +103,19 @@ func (w *Worker) invoke(reply *MessageReply) error {
 	w.activeReply = reply
 	w.lastErr = nil
 
+	pf, err := w.registry.Get(reply.PluginName)
+	if err != nil {
+		w.lastErr = err
+		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
+		return err
+	}
 	switch reply.ActionType {
-	case SinkTask:
-		// Sink uses built-in MongoDB writer — no plugin lookup needed.
-		w.runSink()
-	default:
-		pf, err := w.registry.Get(reply.PluginName)
-		if err != nil {
-			w.lastErr = err
-			w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
-			return err
-		}
-		switch reply.ActionType {
-		case MapTask, FilterTask:
-			w.runMap(pf)
-		case ReduceTask, GroupByTask, SelectKeyTask:
-			w.runReduce(pf)
-		}
+	case MapTask, FilterTask:
+		w.runMap(pf)
+	case ReduceTask:
+		w.runReduce(pf)
+	case SelectKeyTask:
+		w.runSelectKey(pf)
 	}
 	return w.lastErr
 }
@@ -290,77 +280,64 @@ func (w *Worker) reduceErr(pf *PluginFuncs) error {
 // Connection string: MONGO_URI env var (default: mongodb://localhost:27017).
 // Database: MONGO_DB (default: "pipeline").
 // Collection: MONGO_COLLECTION (default: "output").
-func (w *Worker) runSink() {
+// runSelectKey re-keys records from a reduce output. Reads the previous stage's
+// reduce output for this bucket, calls plugin.Map(key, value) to assign new keys,
+// and re-buckets into mr-s<StageIdx>-<inputBucket>-<newBucket> intermediates so a
+// downstream Reduce can glob them with mr-s<N>-*-<newBucket>.
+func (w *Worker) runSelectKey(pf *PluginFuncs) {
+	if err := w.selectKeyErr(pf); err != nil {
+		w.lastErr = err
+		reply := w.activeReply
+		fmt.Printf("[worker %d] selectkey bucket %d failed: %v\n", w.ID, reply.BucketID, err)
+		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
+	}
+}
+
+func (w *Worker) selectKeyErr(pf *PluginFuncs) error {
 	reply := w.activeReply
 
-	pattern := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-out-s%d-*", reply.InputStageIdx))
-	files, err := filepath.Glob(pattern)
-	if err != nil || len(files) == 0 {
-		fmt.Printf("[worker %d] sink: no reduce outputs found matching %s\n", w.ID, pattern)
-		return
+	checkpointGlob := filepath.Join(w.outputDir,
+		fmt.Sprintf("mr-s%d-%d-*", reply.StageIdx, reply.BucketID))
+	if existing, _ := filepath.Glob(checkpointGlob); len(existing) > 0 {
+		fmt.Printf("[worker %d] stage %d selectkey bucket %d: checkpoint found, skipping\n",
+			w.ID, reply.StageIdx, reply.BucketID)
+		return nil
 	}
 
-	// Parse all "key value" lines from every reduce output bucket.
-	var kvs []KeyValue
-	for _, f := range files {
-		file, err := os.Open(f)
-		if err != nil {
-			w.lastErr = fmt.Errorf("sink: open %s: %w", f, err)
-			w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
-			return
-		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			parts := strings.SplitN(scanner.Text(), " ", 2)
-			if len(parts) == 2 {
-				kvs = append(kvs, KeyValue{Key: Key(parts[0]), Value: parts[1]})
-			}
-		}
-		file.Close()
-	}
-
-	mongoURI := os.Getenv("MONGO_URI")
-	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
-	}
-	dbName := os.Getenv("MONGO_DB")
-	if dbName == "" {
-		dbName = "pipeline"
-	}
-	collName := os.Getenv("MONGO_COLLECTION")
-	if collName == "" {
-		collName = "output"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client, err := mongo.Connect(mongoopts.Client().ApplyURI(mongoURI))
+	inPath := filepath.Join(w.outputDir,
+		fmt.Sprintf("mr-out-s%d-%d", reply.InputStageIdx, reply.BucketID))
+	kvs, err := readReduceOutput(inPath)
 	if err != nil {
-		w.lastErr = fmt.Errorf("sink: connect to mongo: %w", err)
-		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
-		return
+		return fmt.Errorf("selectkey: read %s: %w", inPath, err)
 	}
-	defer client.Disconnect(ctx)
 
-	coll := client.Database(dbName).Collection(collName)
+	ring := buildRing(reply.NReduce)
+	bucketKVs := make(map[string][]KeyValue, reply.NReduce)
 	for _, kv := range kvs {
-		filter := bson.D{{Key: "_id", Value: string(kv.Key)}}
-		update := bson.D{{Key: "$set", Value: bson.D{
-			{Key: "value", Value: kv.Value},
-			{Key: "updatedAt", Value: time.Now()},
-		}}}
-		if _, err := coll.UpdateOne(ctx, filter, update,
-			mongoopts.UpdateOne().SetUpsert(true)); err != nil {
-			w.lastErr = fmt.Errorf("sink: upsert key %q: %w", kv.Key, err)
-			w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
-			return
+		result := pf.Map(string(kv.Key), kv.Value.(string))
+		newKVs, ok := result.([]KeyValue)
+		if !ok {
+			return fmt.Errorf("selectkey Map must return []KeyValue, got %T", result)
+		}
+		for _, nkv := range newKVs {
+			bucket, _ := ring.GetNode(string(nkv.Key))
+			bucketKVs[bucket] = append(bucketKVs[bucket], nkv)
 		}
 	}
 
-	fmt.Printf("[worker %d] sink: upserted %d records to %s.%s\n",
-		w.ID, len(kvs), dbName, collName)
+	// Sort each bucket by key before writing so downstream Reduce gets pre-sorted input.
+	for bucket, bkvs := range bucketKVs {
+		sort.Slice(bkvs, func(i, j int) bool { return bkvs[i].Key < bkvs[j].Key })
+		path := filepath.Join(w.outputDir,
+			fmt.Sprintf("mr-s%d-%d-%s", reply.StageIdx, reply.BucketID, bucket))
+		if err := encodeKVs(path, bkvs); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("[worker %d] stage %d selectkey bucket %d → %d new-key buckets\n",
+		w.ID, reply.StageIdx, reply.BucketID, len(bucketKVs))
+	return nil
 }
 
 func (w *Worker) getChunk(chunkID string) ([]byte, error) {
