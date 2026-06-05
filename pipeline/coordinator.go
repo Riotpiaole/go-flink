@@ -53,6 +53,14 @@ type Coordinator struct {
 	// phaseIdx == len(ProcessAction) means all phases complete.
 	phaseIdx int
 
+	// jobID is the UUID of the currently running job. Set in SubmitJob and
+	// restored from Raft snapshots. Used to scope output file paths and MongoDB keys.
+	jobID string
+
+	// phaseUUIDs maps phaseIdx → UUID generated at phase start. Used in file
+	// names and MongoDB _id keys so records are globally unique across re-runs.
+	phaseUUIDs map[int]string
+
 	NReduce  int
 	NumTasks int // total map tasks ever enqueued (grows as source streams)
 
@@ -118,6 +126,7 @@ func NewCoordinator(nReduce int, actions []StreamProcessAction) *Coordinator {
 		ProcessAction: actions,
 		phaseIdx:      0,
 		NReduce:       nReduce,
+		phaseUUIDs:    make(map[int]string),
 		JobStatus:     pq.NewWith(byPriority),
 		inFlight:      make(map[int]*TaskInfo),
 		taskFiles:     make(map[int]string),
@@ -275,6 +284,14 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	action := c.ProcessAction[c.phaseIdx]
 	phaseIdx := c.phaseIdx
 	nReduce := c.NReduce
+	jobID := c.jobID
+	phaseUUID := c.phaseUUIDs[phaseIdx]
+	var inputPhaseUUID string
+	var inputActionType TaskType
+	if phaseIdx > 0 {
+		inputPhaseUUID = c.phaseUUIDs[phaseIdx-1]
+		inputActionType = c.ProcessAction[phaseIdx-1].ActionType
+	}
 	c.mu.Unlock()
 
 	// Replicate dispatch through Raft so inFlight survives leader failover.
@@ -300,20 +317,24 @@ func (c *Coordinator) AskForTask(req *MessageSend, reply *MessageReply) error {
 	reply.FileName = task.FileName
 	reply.ChunkID  = task.ChunkID
 	reply.NReduce  = nReduce
+	reply.JobID    = jobID
 	// BucketID is only meaningful for bucket-parallel phases (Reduce/GroupBy/SelectKey).
 	// For those phases transitionToNextPhase sets TaskId == bucket index, so reuse it.
 	switch action.ActionType {
 	case ReduceTask, GroupByTask, SelectKeyTask:
 		reply.BucketID = task.TaskId
 	}
-	reply.ActionIndex   = phaseIdx
-	reply.PhaseIdx      = phaseIdx
-	reply.ChunkOffset   = task.ChunkOffset
-	reply.PluginName    = action.Name
-	reply.StageIdx      = phaseIdx
-	reply.InputStageIdx = phaseIdx - 1
-	reply.ActionType    = action.ActionType
-	reply.DispatchedAt  = now.UnixNano()
+	reply.ActionIndex      = phaseIdx
+	reply.PhaseIdx         = phaseIdx
+	reply.ChunkOffset      = task.ChunkOffset
+	reply.PluginName       = action.Name
+	reply.StageIdx         = phaseIdx
+	reply.InputStageIdx    = phaseIdx - 1
+	reply.ActionType       = action.ActionType
+	reply.PhaseUUID        = phaseUUID
+	reply.InputPhaseUUID   = inputPhaseUUID
+	reply.InputActionType  = inputActionType
+	reply.DispatchedAt     = now.UnixNano()
 	return nil
 }
 
@@ -345,15 +366,24 @@ func (c *Coordinator) AskForCompactTask(req *MessageSend, reply *MessageReply) e
 		nReduce := c.NReduce
 		action := c.ProcessAction[c.phaseIdx]
 		reducePhaseIdx := c.phaseIdx - 1
+		jobID := c.jobID
+		groupByPhaseUUID := c.phaseUUIDs[phaseIdx]
+		// IsReduceDone checks records written during the Reduce phase, so use the
+		// Reduce phase UUID (phaseIdx-1), not the GroupBy phase UUID.
+		reducePhaseUUID := c.phaseUUIDs[reducePhaseIdx]
+		var reduceActionType TaskType
+		if reducePhaseIdx >= 0 && reducePhaseIdx < len(c.ProcessAction) {
+			reduceActionType = c.ProcessAction[reducePhaseIdx].ActionType
+		}
 		c.mu.Unlock()
 
 		for bucket := 0; bucket < nReduce; bucket++ {
-			if !c.CompactedBucketStore.IsReduceDone(phaseIdx, bucket) {
+			if !c.CompactedBucketStore.IsReduceDone(reducePhaseUUID, bucket) {
 				continue
 			}
 			// ClaimCompactDispatch uses MongoDB insert uniqueness as an atomic claim.
 			// Returns false if another compacter already claimed this bucket.
-			if !c.CompactedBucketStore.ClaimCompactDispatch(phaseIdx, bucket) {
+			if !c.CompactedBucketStore.ClaimCompactDispatch(groupByPhaseUUID, bucket) {
 				continue
 			}
 			now := time.Now()
@@ -373,16 +403,20 @@ func (c *Coordinator) AskForCompactTask(req *MessageSend, reply *MessageReply) e
 				reply.MsgType = Wait
 				return nil
 			}
-			reply.MsgType       = TaskAlloc
-			reply.TaskID        = bucket
-			reply.BucketID      = bucket
-			reply.ActionType    = GroupByTask
-			reply.StageIdx      = phaseIdx
-			reply.InputStageIdx = reducePhaseIdx
-			reply.NReduce       = nReduce
-			reply.PluginName    = action.Name
-			reply.PhaseIdx      = phaseIdx
-			reply.DispatchedAt  = now.UnixNano()
+			reply.MsgType          = TaskAlloc
+			reply.TaskID           = bucket
+			reply.BucketID         = bucket
+			reply.ActionType       = GroupByTask
+			reply.StageIdx         = phaseIdx
+			reply.InputStageIdx    = reducePhaseIdx
+			reply.NReduce          = nReduce
+			reply.PluginName       = action.Name
+			reply.PhaseIdx         = phaseIdx
+			reply.JobID            = jobID
+			reply.PhaseUUID        = groupByPhaseUUID
+			reply.InputPhaseUUID   = reducePhaseUUID
+			reply.InputActionType  = reduceActionType
+			reply.DispatchedAt     = now.UnixNano()
 			return nil
 		}
 		reply.MsgType = Wait
@@ -401,10 +435,18 @@ func (c *Coordinator) AskForCompactTask(req *MessageSend, reply *MessageReply) e
 		action := c.ProcessAction[c.phaseIdx]
 		phaseIdx := c.phaseIdx
 		nReduce := c.NReduce
-		// InputStageIdx = -1 signals Compacter to read mr-out-<bucket> (GroupBy output).
-		// Otherwise it reads mr-out-s<N>-<bucket> (Reduce output).
-		inputStageIdx := phaseIdx - 1
-		if inputStageIdx >= 0 && c.ProcessAction[inputStageIdx].ActionType == GroupByTask {
+		jobID := c.jobID
+		sinkPhaseUUID := c.phaseUUIDs[phaseIdx]
+		inputPhaseIdx := phaseIdx - 1
+		var inputPhaseUUID string
+		var inputActionType TaskType
+		if inputPhaseIdx >= 0 && inputPhaseIdx < len(c.ProcessAction) {
+			inputPhaseUUID = c.phaseUUIDs[inputPhaseIdx]
+			inputActionType = c.ProcessAction[inputPhaseIdx].ActionType
+		}
+		// Legacy: keep InputStageIdx for any code not yet using InputPhaseUUID.
+		inputStageIdx := inputPhaseIdx
+		if inputPhaseIdx >= 0 && c.ProcessAction[inputPhaseIdx].ActionType == GroupByTask {
 			inputStageIdx = -1
 		}
 		c.mu.Unlock()
@@ -423,16 +465,20 @@ func (c *Coordinator) AskForCompactTask(req *MessageSend, reply *MessageReply) e
 			reply.MsgType = Wait
 			return nil
 		}
-		reply.MsgType       = TaskAlloc
-		reply.TaskID        = task.TaskId
-		reply.BucketID      = task.TaskId
-		reply.ActionType    = SinkTask
-		reply.StageIdx      = phaseIdx
-		reply.InputStageIdx = inputStageIdx
-		reply.NReduce       = nReduce
-		reply.PluginName    = action.Name
-		reply.PhaseIdx      = phaseIdx
-		reply.DispatchedAt  = now.UnixNano()
+		reply.MsgType          = TaskAlloc
+		reply.TaskID           = task.TaskId
+		reply.BucketID         = task.TaskId
+		reply.ActionType       = SinkTask
+		reply.StageIdx         = phaseIdx
+		reply.InputStageIdx    = inputStageIdx
+		reply.NReduce          = nReduce
+		reply.PluginName       = action.Name
+		reply.PhaseIdx         = phaseIdx
+		reply.JobID            = jobID
+		reply.PhaseUUID        = sinkPhaseUUID
+		reply.InputPhaseUUID   = inputPhaseUUID
+		reply.InputActionType  = inputActionType
+		reply.DispatchedAt     = now.UnixNano()
 		return nil
 
 	default:
@@ -511,13 +557,16 @@ func (c *Coordinator) NoticeResult(req *MessageSend, reply *MessageReply) error 
 		c.mu.Unlock()
 		// Persist task completion to MongoDB outside the lock so I/O doesn't
 		// stall other RPC handlers waiting on c.mu.
+		c.mu.Lock()
+		phaseUUID := c.phaseUUIDs[req.PhaseIdx]
+		c.mu.Unlock()
 		switch taskActionType {
 		case MapTask:
 			if inflight {
-				c.CompactedBucketStore.MarkMapTaskDone(req.PhaseIdx, req.TaskID, chunkID, task.FileName)
+				c.CompactedBucketStore.MarkMapTaskDone(phaseUUID, req.TaskID, chunkID, task.FileName)
 			}
 		case ReduceTask:
-			c.CompactedBucketStore.MarkReduceDone(req.PhaseIdx, req.TaskID)
+			c.CompactedBucketStore.MarkReduceDone(phaseUUID, req.TaskID)
 		}
 
 	case TaskFailed:
@@ -569,6 +618,8 @@ func (c *Coordinator) SubmitJob(spec *JobSpec, reply *JobReply) error {
 	if spec.NReduce > 0 {
 		c.NReduce = spec.NReduce
 	}
+	c.jobID = spec.JobID
+	c.phaseUUIDs[0] = uuid.New().String()
 	c.mu.Unlock()
 	c.CompactedBucketStore.SetJobID(spec.JobID)
 
@@ -669,8 +720,12 @@ func (c *Coordinator) phaseTotal() int {
 //   - Map, Filter:            one task per input chunk (chunk-parallel)
 //   - Reduce, GroupBy, SelectKey, Sink: one task per NReduce bucket (bucket-parallel)
 func (c *Coordinator) transitionToNextPhase() {
+	// Generate a fresh UUID for the new phase before proposing CmdAdvancePhase so
+	// the UUID is replicated in the WAL entry and available on all nodes after restore.
+	newPhaseUUID := uuid.New().String()
+
 	// Propose phase advancement (increments phaseIdx, resets counters on all nodes).
-	if err := c.proposeCmd(RaftCommand{Type: CmdAdvancePhase}); err != nil {
+	if err := c.proposeCmd(RaftCommand{Type: CmdAdvancePhase, PhaseUUID: newPhaseUUID}); err != nil {
 		fmt.Printf("[coordinator] transitionToNextPhase: proposeCmd: %v\n", err)
 		return
 	}
@@ -685,6 +740,7 @@ func (c *Coordinator) transitionToNextPhase() {
 	phaseIdx := c.phaseIdx
 	numTasks := c.NumTasks
 	nReduce := c.NReduce
+	prevPhaseUUID := c.phaseUUIDs[phaseIdx-1]
 	// Copy the maps we need before releasing the lock.
 	taskFiles := make(map[int]string, numTasks)
 	taskFileNames := make(map[int]string, numTasks)
@@ -697,8 +753,8 @@ func (c *Coordinator) transitionToNextPhase() {
 	// the Raft snapshot was taken mid-Map-phase. Falls back to taskFiles if
 	// MongoDB returns nothing (nil client or local embedded mode).
 	if action.ActionType == ReduceTask || action.ActionType == SelectKeyTask {
-		if mongoFiles, mongoNames, err := c.CompactedBucketStore.MapTaskOutputs(phaseIdx - 1); err != nil {
-			log.Printf("[coordinator] warning: MapTaskOutputs phase %d: %v — using in-memory taskFiles", phaseIdx-1, err)
+		if mongoFiles, mongoNames, err := c.CompactedBucketStore.MapTaskOutputs(prevPhaseUUID); err != nil {
+			log.Printf("[coordinator] warning: MapTaskOutputs phaseUUID %s: %v — using in-memory taskFiles", prevPhaseUUID, err)
 		} else if len(mongoFiles) > 0 {
 			taskFiles = mongoFiles
 			taskFileNames = mongoNames

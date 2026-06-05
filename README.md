@@ -31,7 +31,7 @@ CGO_ENABLED=1 go build -buildmode=plugin -o plugins/wc.so ./plugin/
 ./go-flink run --plugin wc --dir ./datasets --n-reduce 4
 ```
 
-This starts an embedded coordinator, reads all files from `./datasets`, and spins up workers in-process. Results land in `./mr-out/`.
+This starts an embedded coordinator, reads all files from `./datasets`, and spins up workers in-process. Results land in `./mr-out/<jobUUID>/` with stage-scoped subdirectories.
 
 ### 3. Add workers for more parallelism
 
@@ -201,23 +201,32 @@ go-flink submit
 
 ## Intermediate file naming
 
-| Stage type | Pattern written | Read by |
-|---|---|---|
-| Map / Filter | `mr-s<N>-<chunkID>-<bucket>` | next Reduce stage (`mr-s<N>-*-<bucket>`) |
-| Reduce | `mr-out-s<N>-<bucket>` | GroupBy or Sink |
-| SelectKey | `mr-s<N>-<inBucket>-<newBucket>` | next Reduce stage |
-| GroupBy | `mr-out-<bucket>` (no stage index) | Sink |
-| Sink | → MongoDB | — |
+Files are written under a job-scoped directory tree so concurrent and repeated jobs never collide:
 
-The stage index `N` is embedded in filenames so multi-stage pipelines never collide.
+```
+<outputDir>/<jobID>/<actionType>/mr-<phaseUUID>-<rest>
+```
+
+| Stage | Output path | MongoDB collection |
+|---|---|---|
+| Map / Filter | `<out>/<jobID>/map/mr-<phaseUUID>-<chunkID>-<bucket>` | `map_task` — `"<jobID>:<phaseUUID>:<taskID>"` |
+| Reduce | `<out>/<jobID>/reduce/mr-<phaseUUID>-<bucket>` | `reduction` — `"<jobID>:<phaseUUID>:<bucket>"` |
+| SelectKey | `<out>/<jobID>/selectkey/mr-<phaseUUID>-<srcBucket>-<newBucket>` | *(not tracked)* |
+| GroupBy | `<out>/<jobID>/groupby/mr-<phaseUUID>-<bucket>` | `compaction` — dispatch claim |
+| Sink | → MongoDB (`output` collection) | `sink_result` — audit record |
+
+- `jobID` — stable UUID per job (generated in `SubmitJob` or `pipeline.Start()`)
+- `phaseUUID` — UUID per phase, replicated through the Raft WAL so it survives leader failover
+- MongoDB `_id` format: `"<jobID>:<phaseUUID>:<taskID-or-bucket>"` — globally unique across re-runs
 
 ---
 
 ## Dependencies
 
 - [hashicorp/raft](https://github.com/hashicorp/raft) — Raft consensus for leader election and log replication
+- [hashicorp/raft-boltdb/v2](https://github.com/hashicorp/raft-boltdb) — BoltDB-backed persistent Raft WAL and stable store (replaces in-memory store)
 - [spf13/cobra](https://github.com/spf13/cobra) — CLI
 - [emirpasic/gods](https://github.com/emirpasic/gods) — priority queue for task scheduling
 - [serialx/hashring](https://github.com/serialx/hashring) — consistent hashing for reduce bucket assignment
-- [google/uuid](https://github.com/google/uuid) — chunk identity
-- [go.mongodb.org/mongo-driver/v2](https://pkg.go.dev/go.mongodb.org/mongo-driver/v2) — MongoDB sink
+- [google/uuid](https://github.com/google/uuid) — job / chunk / phase identity
+- [go.mongodb.org/mongo-driver/v2](https://pkg.go.dev/go.mongodb.org/mongo-driver/v2) — MongoDB sink + job-keying metadata

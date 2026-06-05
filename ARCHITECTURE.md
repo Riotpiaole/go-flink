@@ -11,9 +11,10 @@ Workers execute Map, Filter, Reduce, and SelectKey stages. A separate Compacter 
 │  go-flink node (3 replicas — StatefulSet in k8s)                    │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │  Raft consensus layer (hashicorp/raft)                          │  │
-│  │  Replicates: inFlight tasks, phaseIdx, phaseDone,              │  │
-│  │              taskFiles, chunkStore (nil on followers)           │  │
+│  │  Raft consensus layer (hashicorp/raft + BoltDB WAL)             │  │
+│  │  Replicates: inFlight dispatches, phaseIdx, phaseUUIDs,        │  │
+│  │              phaseDone, taskFiles, jobID, chunkStore (nil on   │  │
+│  │              followers); WAL persisted to disk via BoltDB       │  │
 │  └──────────────────┬─────────────────────────────────────────────┘  │
 │                     │                                                 │
 │             leader elected                                            │
@@ -60,43 +61,47 @@ The coordinator only serves RPCs when it is the Raft leader. Followers receive `
 
 Key responsibilities:
 - `listenFromDataSource` — consumes `ChunkQueue`, stores chunk bytes in `chunkStore`, proposes `CmdEnqueueTask` via Raft
-- `AskForTask` — dequeues the next `TaskInfo` for Map/Filter/Reduce/SelectKey, marks it in-flight, returns `MessageReply`
-- `AskForCompactTask` — reactive dispatch for GroupBy (per completed Reduce bucket) and pre-enqueued Sink tasks
-- `NoticeResult` — handles `TaskSuccess` / `TaskFailed` / `TaskContinue` from both workers and compacters
-- `SubmitJob` — accepts a `JobSpec` from a remote client, builds a `DataSource`, wires up `ProcessAction` stages, starts streaming chunks
-- `sweepTimedOutTasks` — runs every 5 s, re-enqueues tasks whose workers have gone silent for > 30 s
-- `transitionToNextPhase` — advances `phaseIdx`, enqueues tasks for the new phase (chunk-parallel for Map/Filter, bucket-parallel for Reduce/SelectKey/Sink; GroupBy is not pre-enqueued)
-- `watchLeadership` — reacts to `LeaderCh()`: on becoming leader activates coordinator role; on becoming follower starts a local worker loop pointed at the current leader's RPC address
+- `AskForTask` — dequeues the next `TaskInfo`, proposes `CmdDispatchTask` through Raft (persists dispatch in WAL), fills `MessageReply` with `JobID`, `PhaseUUID`, `InputPhaseUUID`, `InputActionType`
+- `AskForCompactTask` — reactive GroupBy dispatch (reads `reduceDone` from MongoDB using `reducePhaseUUID`) and pre-enqueued Sink tasks; GroupBy dispatch claimed atomically via MongoDB insert
+- `NoticeResult` — handles `TaskSuccess` / `TaskFailed` / `TaskContinue`; on Map/Reduce success persists completion to MongoDB using `c.phaseUUIDs[req.PhaseIdx]`
+- `SubmitJob` — accepts a `JobSpec`, assigns `c.jobID` and `c.phaseUUIDs[0]`, builds `DataSource`, starts streaming
+- `sweepTimedOutTasks` — runs every 5 s, re-enqueues tasks silent for > 30 s (up to 3 retries)
+- `transitionToNextPhase` — generates a new `phaseUUID`, proposes `CmdAdvancePhase{PhaseUUID}` through Raft, enqueues tasks for the new phase
+- `watchLeadership` — on becoming leader activates coordinator role; on becoming follower starts a local worker loop pointed at the current leader's RPC address
 
 ### Raft FSM (`pipeline/raft_commands.go`)
 
 The Raft log replicates coordinator metadata. Each log entry is a JSON-encoded `RaftCommand`:
 
-| Command             | Effect on all nodes                                                                |
-|---------------------|------------------------------------------------------------------------------------|
-| `CmdEnqueueTask`    | Add task to `JobStatus` queue; store nil placeholder in `chunkStore` on followers  |
-| `CmdDispatchTask`   | Record `DispatchedAt` timestamp in `inFlight`                                      |
-| `CmdCompleteTask`   | Remove from `inFlight`, increment `phaseDone`, evict chunk                         |
-| `CmdFailTask`       | Remove from `inFlight`, increment retries; re-enqueue or count as done             |
-| `CmdAdvancePhase`   | Increment `phaseIdx`, reset `phaseDone` and `inFlight`                             |
+| Command             | Effect on all nodes                                                                         |
+|---------------------|---------------------------------------------------------------------------------------------|
+| `CmdEnqueueTask`    | Add task to `JobStatus` queue; store nil placeholder in `chunkStore` on followers           |
+| `CmdDispatchTask`   | Add full `TaskInfo` to `inFlight` with `DispatchedAt`; remove from queue on WAL replay      |
+| `CmdCompleteTask`   | Remove from `inFlight`, increment `phaseDone`, evict chunk                                  |
+| `CmdFailTask`       | Remove from `inFlight`, increment retries; re-enqueue or count as done                      |
+| `CmdAdvancePhase`   | Increment `phaseIdx`, store new `phaseUUID`, reset `phaseDone` and `inFlight`               |
 
-`Snapshot` / `Restore` serialize `inFlight`, counters, `taskFiles`, and the queue contents so a new leader can resume without replaying the full log.
+`Snapshot` / `Restore` serialize `inFlight`, counters, `taskFiles`, `jobID`, `phaseUUIDs`, and the queue contents so a new leader can resume without replaying the full log. The Raft log and stable stores are backed by BoltDB (`<dataDir>/raft.db`) — not in-memory — so WAL entries survive pod restarts.
 
 ### Worker (`pipeline/worker.go`)
 
 Workers are stateless. Each task assignment (`MessageReply`) carries everything needed to execute it:
 
-| Field            | Purpose                                                                      |
-|------------------|------------------------------------------------------------------------------|
-| `PluginName`     | Which `.so` to load (e.g. `"wc"`)                                            |
-| `ActionType`     | `MapTask` / `FilterTask` / `ReduceTask` / `SelectKeyTask`                    |
-| `StageIdx`       | Current stage index — used to name output files (`mr-s<N>-…`)                |
-| `InputStageIdx`  | Stage whose output files are this task's inputs                              |
-| `ChunkID`        | UUID of the raw chunk (for Map stage 0 only)                                 |
-| `BucketID`       | Consistent-hash bucket (for Reduce stages)                                   |
-| `NReduce`        | Total bucket count (for hashing in Map stages)                               |
-| `PhaseIdx`       | Guards against stale reports after a sweeper re-dispatch                     |
-| `DispatchedAt`   | Echoed back so the coordinator can reject stale `NoticeResult` calls         |
+| Field             | Purpose                                                                                     |
+|-------------------|---------------------------------------------------------------------------------------------|
+| `PluginName`      | Which `.so` to load (e.g. `"wc"`)                                                           |
+| `ActionType`      | `MapTask` / `FilterTask` / `ReduceTask` / `SelectKeyTask`                                   |
+| `JobID`           | UUID of the current job — scopes output directory and MongoDB keys                          |
+| `PhaseUUID`       | UUID of the current phase — used as filename prefix (`mr-<phaseUUID>-…`)                    |
+| `InputPhaseUUID`  | UUID of the input phase — used to glob input files                                          |
+| `InputActionType` | `ActionType` of the input phase — resolves the `inDir()` subfolder                         |
+| `ChunkID`         | UUID of the raw chunk (for Map stage 0 only)                                                |
+| `BucketID`        | Consistent-hash bucket (for Reduce stages)                                                  |
+| `NReduce`         | Total bucket count (for hashing in Map stages)                                              |
+| `PhaseIdx`        | Guards against stale reports after a sweeper re-dispatch                                    |
+| `DispatchedAt`    | Echoed back so the coordinator can reject stale `NoticeResult` calls                        |
+| `StageIdx`        | *(legacy)* Stage index — kept for backward compat; prefer `PhaseUUID` for path construction |
+| `InputStageIdx`   | *(legacy)* Input stage index — kept for backward compat; prefer `InputPhaseUUID`            |
 
 Workers connect to the coordinator via TCP (`--coordinator host:port`) in distributed mode, or via Unix socket in embedded single-node mode.
 
@@ -104,15 +109,15 @@ Workers connect to the coordinator via TCP (`--coordinator host:port`) in distri
 
 Compacters are an independent pool — the coordinator has no knowledge of them. They poll `AskForCompactTask` RPC and handle two task types:
 
-**GroupBy** — reactive compaction. The coordinator dispatches one GroupBy task per Reduce bucket the moment that bucket reports `TaskSuccess` (tracked in `reduceDoneBuckets`). Compacters:
-1. Glob all `mr-out-s*-<bucket>` files from the shared output dir
+**GroupBy** — reactive compaction. The coordinator dispatches one GroupBy task per Reduce bucket the moment that bucket reports `TaskSuccess`. Completion is tracked in MongoDB (`reduction` collection, keyed `"<jobID>:<phaseUUID>:<bucket>"`), so dispatch state survives leader failover without a ~30 s sweeper delay. Atomic dispatch is claimed via a MongoDB insert into `compaction` — two compacters can never process the same bucket. Compacters:
+1. Glob all `mr-*-<bucket>` files in the `<jobID>/reduce/` subfolder
 2. Parse, sort, and group by key
 3. Call `plugin.Reduce(key, values)` for each group
-4. Atomically write `mr-out-<bucket>` (write to `.tmp`, then `os.Rename`)
+4. Atomically write `<jobID>/groupby/mr-<phaseUUID>-<bucket>` (write to `.tmp`, then `os.Rename`)
 
-**Sink** — pre-enqueued one-per-bucket tasks. Compacters read the final output files and upsert each key-value pair into MongoDB. MongoDB URI is injected via the `MONGO_URI` environment variable (K8s Secret).
+**Sink** — pre-enqueued one-per-bucket tasks. Compacters read the final GroupBy (or Reduce) output files and upsert each key-value pair into MongoDB. On success, `MarkSinkDone` writes an audit record to the `sink_result` collection. MongoDB URI is injected via the `MONGO_URI` environment variable (K8s Secret).
 
-Compacters connect to the coordinator the same way workers do — via TCP or Unix socket — and report results through the shared `NoticeResult` RPC.
+Compacters hold a `*CompactedBucketStore` (field `store`) initialized at startup and connected to MongoDB. `jobID` is set lazily from the first `TaskAlloc` reply. Compacters connect to the coordinator via TCP or Unix socket and report results through `NoticeResult` RPC.
 
 In `go-flink node` mode, each pod co-locates `--compacters` (default 1) compacter goroutines started directly in `main.go`, pointing at the node's own RPC address. They are independent of the coordinator's `watchLeadership` loop.
 
@@ -185,32 +190,34 @@ Priority Task Queue  (phase 0 = Map)
     │
     ├── Worker polls AskForTask ──► GetChunk(ChunkID) [stage 0 only]
     │   run plugin.Map(filename, content)
-    │   write mr-s0-<chunkID>-<bucket> (one file per hash bucket)
-    │   NoticeResult(TaskSuccess)
+    │   write <jobID>/map/mr-<p0uuid>-<chunkID>-<bucket>
+    │   NoticeResult(TaskSuccess) ──► MarkMapTaskDone(p0uuid, taskID) → MongoDB map_task
     │
-    ▼  [all Map tasks done → transitionToNextPhase]
+    ▼  [all Map tasks done → transitionToNextPhase → generates p1uuid]
 Priority Task Queue  (phase 1 = Reduce, NReduce tasks)
     │
-    ├── Worker polls AskForTask
-    │   glob mr-s0-*-<bucketID> from shared output dir
+    ├── Worker polls AskForTask (reply carries InputPhaseUUID=p0uuid)
+    │   glob <jobID>/map/mr-p0uuid-*-<bucketID>
     │   sort + group by key
     │   run plugin.Reduce(key, values)
-    │   write mr-out-s1-<bucketID>
-    │   NoticeResult(TaskSuccess)
+    │   write <jobID>/reduce/mr-<p1uuid>-<bucketID>
+    │   NoticeResult(TaskSuccess) ──► MarkReduceDone(p1uuid, bucket) → MongoDB reduction
     │       │
-    │       └──► reduceDoneBuckets[bucket]=true
-    │            Compacter polls AskForCompactTask (reactive GroupBy)
-    │            glob mr-out-s*-<bucket>
+    │       └──► Compacter polls AskForCompactTask (reactive GroupBy)
+    │            reads MongoDB reduction[p1uuid, bucket] → IsReduceDone=true
+    │            claims MongoDB compaction[p2uuid, bucket] atomically
+    │            glob <jobID>/reduce/mr-*-<bucket>
     │            sort + group → plugin.Reduce
-    │            atomic write mr-out-<bucket>
+    │            atomic write <jobID>/groupby/mr-<p2uuid>-<bucket>
     │            NoticeResult(TaskSuccess)
     │
     ▼  [all Reduce + GroupBy tasks done]
 Pre-enqueued Sink tasks (one per bucket)
     │
-    └── Compacter polls AskForCompactTask
-        read mr-out-<bucket>  (after GroupBy)
-        upsert each KV to MongoDB
+    └── Compacter polls AskForCompactTask (reply carries InputPhaseUUID=p2uuid, InputActionType=GroupByTask)
+        read <jobID>/groupby/mr-<p2uuid>-<bucket>
+        upsert each KV to MongoDB output collection
+        MarkSinkDone(p3uuid, bucket) → MongoDB sink_result
         NoticeResult(TaskSuccess)
     │
     ▼
@@ -230,6 +237,7 @@ Worker                                      Coordinator (leader)
   │                                              │  dequeue TaskInfo from JobStatus queue
   │                                              │  mark task in-flight; set DispatchedAt
   │ ◄─ TaskAlloc(ChunkID, StageIdx=0, ─────────  │
+  │              JobID, PhaseUUID,               │
   │              PluginName, NReduce,            │
   │              PhaseIdx, DispatchedAt)         │
   │                                              │
@@ -238,7 +246,7 @@ Worker                                      Coordinator (leader)
   │                                              │
   │  [PluginRegistry.Get("wc")]                  │
   │  [run plugin.Map(filename, content)]         │
-  │  [write mr-s0-<chunkID>-<bucket> per key]   │
+  │  [write <jobID>/map/mr-<phaseUUID>-<chunkID>-<bucket>] │
   │                                              │
   │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
   │                  PhaseIdx, DispatchedAt)     │  proposeCmd(CmdCompleteTask)
@@ -254,12 +262,14 @@ Worker                                      Coordinator (leader)
   │  ── AskForTask(MsgType=AskForTask) ────────► │
   │                                              │  dequeue reduce TaskInfo (one per bucket)
   │ ◄─ TaskAlloc(BucketID, StageIdx=1, ────────  │
-  │              InputStageIdx=0, PluginName)    │
+  │              JobID, PhaseUUID,               │
+  │              InputPhaseUUID, InputActionType,│
+  │              PluginName)                     │
   │                                              │
-  │  [glob mr-s0-*-<BucketID> from output dir]  │
+  │  [glob <jobID>/map/mr-<InputPhaseUUID>-*-<BucketID>] │
   │  [sort + group by key]                       │
   │  [run plugin.Reduce(key, values)]            │
-  │  [write mr-out-s1-<BucketID>]               │
+  │  [write <jobID>/reduce/mr-<PhaseUUID>-<BucketID>]   │
   │                                              │
   │  ── NoticeResult(TaskSuccess, TaskID, ─────► │
   │                  PhaseIdx, DispatchedAt)     │  proposeCmd(CmdCompleteTask)
@@ -274,14 +284,16 @@ Worker                                      Coordinator (leader)
 Compacter                                   Coordinator (leader)
   │                                              │
   │  ── AskForCompactTask ─────────────────────► │
-  │                                              │  scan reduceDoneBuckets for undispatched bucket
-  │                                              │  compactDispatched[bucket]=true
-  │ ◄─ GroupByTask(BucketID) ──────────────────  │
+  │                                              │  IsReduceDone(reducePhaseUUID, bucket) → MongoDB
+  │                                              │  ClaimCompactDispatch(groupByPhaseUUID, bucket) → MongoDB
+  │ ◄─ GroupByTask(BucketID, PhaseUUID, ───────  │
+  │               InputPhaseUUID,               │
+  │               InputActionType=ReduceTask)   │
   │                                              │
-  │  [glob mr-out-s*-<BucketID>]                │
+  │  [glob <jobID>/reduce/mr-*-<BucketID>]      │
   │  [parse, sort, group by key]                 │
   │  [plugin.Reduce(key, values)]               │
-  │  [atomic write mr-out-<BucketID>]           │
+  │  [atomic write <jobID>/groupby/mr-<phaseUUID>-<BucketID>] │
   │                                              │
   │  ── NoticeResult(TaskSuccess) ─────────────► │  phaseDone++ for GroupBy phase
 ```
@@ -293,10 +305,13 @@ Compacter                                   Coordinator (leader)
   │                                              │
   │  ── AskForCompactTask ─────────────────────► │
   │                                              │  dequeue pre-enqueued Sink task
-  │ ◄─ SinkTask(BucketID) ─────────────────────  │
+  │ ◄─ SinkTask(BucketID, PhaseUUID, ──────────  │
+  │              InputPhaseUUID,                │
+  │              InputActionType=GroupByTask)   │
   │                                              │
-  │  [read mr-out-<BucketID>]                   │
+  │  [read <jobID>/groupby/mr-<InputPhaseUUID>-<BucketID>] │
   │  [upsert each KV to MongoDB]                │
+  │  [MarkSinkDone → sink_result collection]    │
   │                                              │
   │  ── NoticeResult(TaskSuccess) ─────────────► │  phaseDone++; if all done → Done()
 ```
@@ -341,16 +356,62 @@ Worker                              Coordinator (sweeper, every 5 s)
 
 ## Fault tolerance
 
-| Failure                                | Behaviour                                                                     |
-|----------------------------------------|-------------------------------------------------------------------------------|
-| Worker crashes mid-task                | Sweeper detects silence after 30 s → re-enqueues (up to 3 retries)            |
-| Worker returns TaskFailed              | Re-enqueued immediately via Raft log                                          |
-| Leader crashes                         | Raft elects new leader; new leader resumes from replicated `inFlight` + queue |
-| GroupBy stalls on leader failover      | `reduceDoneBuckets`/`compactDispatched` are in-memory only (not Raft-replicated) — new leader re-dispatches after ~30 s sweeper timeout |
-| Stale report after sweeper re-dispatch | Rejected by `DispatchedAt` token mismatch in `NoticeResult`                   |
-| Stale report from old phase            | Rejected by `PhaseIdx` guard                                                  |
-| Task exhausts retries                  | Counted as done (partial results), pipeline continues                         |
-| Duplicate map output                   | Workers detect existing checkpoint file and skip re-execution                 |
+| Failure                                | Behaviour                                                                                                     |
+|----------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| Worker crashes mid-task                | Sweeper detects silence after 30 s → re-enqueues (up to 3 retries)                                           |
+| Worker returns TaskFailed              | Re-enqueued immediately via Raft log                                                                          |
+| Leader crashes                         | Raft elects new leader; resumes from BoltDB WAL + snapshot (`inFlight`, queue, `phaseUUIDs`, `jobID`)        |
+| GroupBy stalls on leader failover      | **Fixed** — `reduceDone` and dispatch claims are in MongoDB (keyed by `phaseUUID`); new leader reads them immediately, no sweeper wait |
+| Stale report after sweeper re-dispatch | Rejected by `DispatchedAt` token mismatch in `NoticeResult`                                                   |
+| Stale report from old phase            | Rejected by `PhaseIdx` guard                                                                                  |
+| Task exhausts retries                  | Counted as done (partial results), pipeline continues                                                         |
+| Duplicate map output                   | Workers detect existing checkpoint file (glob on `mr-<phaseUUID>-<chunkID>-*`) and skip re-execution         |
+| Concurrent jobs overwriting files      | **Fixed** — each job writes to `<outputDir>/<jobID>/…`; re-runs and parallel jobs never collide              |
+
+---
+
+## MongoDB collections (`CompactedBucketStore`)
+
+All documents use `_id = "<jobID>:<phaseUUID>:<taskID-or-bucket>"`, making them globally unique across jobs and re-runs.
+
+| Collection    | Written by                     | Purpose                                                                 |
+|---------------|--------------------------------|-------------------------------------------------------------------------|
+| `map_task`    | Coordinator `NoticeResult`     | Map task completion — `chunkID` + `fileName` for post-failover recovery |
+| `reduction`   | Coordinator `NoticeResult`     | Reduce bucket completion — drives reactive GroupBy dispatch             |
+| `compaction`  | Coordinator `AskForCompactTask`| Atomic GroupBy dispatch claim — prevents double-dispatch across compacters |
+| `sink_result` | Compacter `sinkErr`            | Sink bucket audit — records `records_written`, `database`, `collection` |
+
+All methods degrade gracefully when `MONGO_URI` is unset or MongoDB is unreachable: writes are no-ops, reads return `false`/`nil`, and the coordinator falls back to in-process state for GroupBy dispatch.
+
+---
+
+## Observability
+
+### Service metrics (`[SERVICE_METRIC]`)
+
+Emitted by workers and compacters via `M(txnID, event).Set(k, v).Emit()`:
+
+```
+[SERVICE_METRIC] txn=<jobID>:<phaseUUID> map_task
+  chunk_id             = c0a
+  file_name            = part-0.txt
+  total_latency_ms     = 250
+  chunk_fetch_ms       = 45
+  process_ms           = 198
+  kvs_produced         = 3847
+  buckets_written      = 3
+  success              = true
+```
+
+Events: `map_task`, `reduce_task`, `selectkey_task`, `groupby_task`, `sink_task`.
+
+### Application metrics (`[APP_METRIC]`)
+
+Emitted on errors with a stack trace via `EmitError(err)`:
+
+```
+[APP_METRIC] ERROR txn=<jobID>:<phaseUUID> map_task err=... | trace=goroutine 1 [running]:...
+```
 
 ---
 
@@ -401,7 +462,10 @@ k8s/
 │   ├── pluginregistry.go            # Lazy-loading .so plugin cache
 │   ├── loadplugin.go                # plugin.Open + symbol validation
 │   ├── job.go                       # JobSpec, StageSpec, SourceConfig, KafkaConfig (stub)
-│   ├── rpc.go                       # MessageSend/Reply, KeyValue, ChunkRequest/Reply
+│   ├── rpc.go                       # MessageSend/Reply (incl. JobID/PhaseUUID/InputPhaseUUID/InputActionType), KeyValue, ChunkRequest/Reply
+│   ├── compacted_bucket_store.go    # MongoDB job-keying: map_task/reduction/compaction/sink_result collections; phaseUUID-scoped keys
+│   ├── service_metric.go            # Structured observability: Metric/M/Set/Emit/EmitError, txnID, appLog, actionDir
+│   ├── observability.go             # serviceLog, elapsed helpers
 │   ├── coordinator_constants.go     # TaskStatus enum + priority map
 │   ├── interface.go                 # TaskType enum (MapTask, ReduceTask, GroupByTask, …)
 │   └── datasource/

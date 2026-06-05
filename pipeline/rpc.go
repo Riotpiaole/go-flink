@@ -52,17 +52,23 @@ type MessageReply struct {
 	TaskName    string // file path for phase 0 (map)
 	FileName    string // base file name of the source chunk
 	ChunkID     string // UUID identifying this specific file chunk
-	JobID       string // UUID of the pipeline job; used to scope output directories and MongoDB keys
+	JobID       string // UUID of the pipeline job; scopes output directories and MongoDB keys
 	BucketID    int    // partition index for reduce/groupby stages
 	ActionIndex int    // kept for backward compatibility; prefer StageIdx
 	PhaseIdx     int    // coordinator's current phaseIdx at dispatch time
 	ChunkOffset  int64  // byte offset where this map task should begin reading
 	DispatchedAt int64  // unix-nano timestamp of this dispatch; echoed back in MessageSend to detect stale reports
 
+	// Phase-UUID fields — used for job-isolated file paths and MongoDB keys.
+	// Format: <outputDir>/<jobID>/<actionDir>/mr-<PhaseUUID>-...
+	PhaseUUID      string   // UUID of the current phase; unique per phase across all jobs
+	InputPhaseUUID string   // UUID of the phase whose outputs are this task's inputs
+	InputActionType TaskType // ActionType of the input phase; drives inDir() subfolder resolution
+
 	// Stage-aware execution graph fields
 	PluginName    string   // plugin filename stem to load (e.g. "wc")
 	StageIdx      int      // which stage in the pipeline this task belongs to
-	InputStageIdx int      // stage whose output files are this task's inputs
+	InputStageIdx int      // stage whose output files are this task's inputs (legacy; prefer InputPhaseUUID)
 	ActionType    TaskType // Map | Filter | Reduce | GroupBy | Sink
 }
 

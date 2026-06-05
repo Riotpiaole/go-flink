@@ -28,17 +28,44 @@ type Compacter struct {
 	coordinatorAddr string
 	activeReply     *MessageReply
 	lastErr         error
+	store           *CompactedBucketStore // for MarkSinkDone audit writes
+}
+
+// outDir returns the directory where this task writes its output files.
+func (c *Compacter) outDir(r *MessageReply) string {
+	if r.JobID == "" {
+		return c.outputDir
+	}
+	dir := filepath.Join(c.outputDir, r.JobID, actionDir(r.ActionType))
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// inDir returns the directory where this task reads its input files.
+func (c *Compacter) inDir(r *MessageReply) string {
+	if r.JobID == "" {
+		return c.outputDir
+	}
+	return filepath.Join(c.outputDir, r.JobID, actionDir(r.InputActionType))
 }
 
 // StartCompacter runs a Compacter against the local embedded coordinator (Unix socket).
 func StartCompacter(id int, registry *PluginRegistry, outputDir string) {
 	c := &Compacter{ID: id, registry: registry, outputDir: outputDir}
+	c.store = NewCompactedBucketStore("")
+	if err := c.store.Connect(os.Getenv("MONGO_URI")); err != nil {
+		fmt.Printf("[compacter %d] warning: MongoDB unavailable: %v\n", id, err)
+	}
 	runCompacterLoop(c)
 }
 
 // StartCompacterRemote runs a Compacter against a remote coordinator at addr (host:port).
 func StartCompacterRemote(id int, registry *PluginRegistry, outputDir, coordinatorAddr string) {
 	c := &Compacter{ID: id, registry: registry, outputDir: outputDir, coordinatorAddr: coordinatorAddr}
+	c.store = NewCompactedBucketStore("")
+	if err := c.store.Connect(os.Getenv("MONGO_URI")); err != nil {
+		fmt.Printf("[compacter %d] warning: MongoDB unavailable: %v\n", id, err)
+	}
 	runCompacterLoop(c)
 }
 
@@ -99,6 +126,10 @@ func runCompacterLoop(c *Compacter) {
 		default:
 			c.activeReply = reply
 			c.lastErr = nil
+			// Propagate jobID to store on first non-empty reply (lazy init).
+			if reply.JobID != "" && c.store.JobID() == "" {
+				c.store.SetJobID(reply.JobID)
+			}
 			var err error
 			switch reply.ActionType {
 			case GroupByTask:
@@ -114,6 +145,12 @@ func runCompacterLoop(c *Compacter) {
 			}
 			if err != nil {
 				c.lastErr = err
+				if reply.ActionType == SinkTask {
+					M(txnID(reply), "sink_task").
+						Set("bucket_id", reply.BucketID).
+						Set("success", false).
+						EmitError(err)
+				}
 				c.reportStatus(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
 			} else {
 				c.reportStatus(TaskSuccess, reply.TaskID, reply.TaskName, reply.PhaseIdx)
@@ -122,29 +159,33 @@ func runCompacterLoop(c *Compacter) {
 	}
 }
 
-// groupByErr compacts ALL staged reduce outputs for a given bucket into mr-out-<bucket>.
+// groupByErr compacts ALL staged reduce outputs for a given bucket into one file.
 // Uses an atomic write (temp file → rename) so the checkpoint is safe on retry.
 func (c *Compacter) groupByErr(pf *PluginFuncs) error {
 	reply := c.activeReply
-	outPath := filepath.Join(c.outputDir, fmt.Sprintf("mr-out-%d", reply.BucketID))
+	totalStart := time.Now()
+	outD := c.outDir(reply)
+	outPath := filepath.Join(outD, fmt.Sprintf("mr-%s-%d", reply.PhaseUUID, reply.BucketID))
 	tmpPath := outPath + ".tmp"
 
 	if _, err := os.Stat(outPath); err == nil {
-		fmt.Printf("[compacter %d] groupby bucket %d: checkpoint found, skipping\n",
-			c.ID, reply.BucketID)
+		appLog(txnID(reply), "INFO", fmt.Sprintf("groupby bucket=%d checkpoint found, skipping", reply.BucketID))
 		return nil
 	}
 
-	// Read ALL prior staged reduce outputs for this bucket (cross-stage compaction).
-	pattern := filepath.Join(c.outputDir, fmt.Sprintf("mr-out-s*-%d", reply.BucketID))
+	// Glob all reduce outputs for this bucket across all reduce phases.
+	globStart := time.Now()
+	pattern := filepath.Join(c.inDir(reply), fmt.Sprintf("mr-*-%d", reply.BucketID))
 	files, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("groupby bucket %d: no staged reduce outputs found", reply.BucketID)
+		return fmt.Errorf("groupby bucket %d: no reduce outputs found (pattern=%s)", reply.BucketID, pattern)
 	}
+	globMs := time.Since(globStart).Milliseconds()
 
+	processStart := time.Now()
 	var intermediate []KeyValue
 	for _, fname := range files {
 		f, err := os.Open(fname)
@@ -162,7 +203,9 @@ func (c *Compacter) groupByErr(pf *PluginFuncs) error {
 	}
 
 	sort.Slice(intermediate, func(i, j int) bool { return intermediate[i].Key < intermediate[j].Key })
+	processMs := time.Since(processStart).Milliseconds()
 
+	writeStart := time.Now()
 	tmp, err := os.Create(tmpPath)
 	if err != nil {
 		return err
@@ -199,31 +242,35 @@ func (c *Compacter) groupByErr(pf *PluginFuncs) error {
 		os.Remove(tmpPath)
 		return writeErr
 	}
-
 	if err := os.Rename(tmpPath, outPath); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
+	fileWriteMs := time.Since(writeStart).Milliseconds()
 
-	fmt.Printf("[compacter %d] groupby bucket %d → %s (%d unique keys)\n",
-		c.ID, reply.BucketID, outPath, len(written))
+	M(txnID(reply), "groupby_task").
+		Set("bucket_id", reply.BucketID).
+		Set("total_latency_ms", time.Since(totalStart).Milliseconds()).
+		Set("files_glob_ms", globMs).
+		Set("process_ms", processMs).
+		Set("file_write_ms", fileWriteMs).
+		Set("keys_written", len(written)).
+		Set("success", true).
+		Emit()
 	return nil
 }
 
 // sinkErr writes one bucket's compacted output to MongoDB.
-// InputStageIdx < 0 means read mr-out-<bucket> (after GroupBy);
-// InputStageIdx >= 0 means read mr-out-s<N>-<bucket> (after Reduce directly).
+// Reads from inDir(reply) which resolves to the correct subfolder (groupby/ or
+// reduce/) based on InputActionType — no special-casing InputStageIdx<0 needed.
 func (c *Compacter) sinkErr() error {
 	reply := c.activeReply
+	totalStart := time.Now()
 
-	var inPath string
-	if reply.InputStageIdx < 0 {
-		inPath = filepath.Join(c.outputDir, fmt.Sprintf("mr-out-%d", reply.BucketID))
-	} else {
-		inPath = filepath.Join(c.outputDir,
-			fmt.Sprintf("mr-out-s%d-%d", reply.InputStageIdx, reply.BucketID))
-	}
+	inPath := filepath.Join(c.inDir(reply),
+		fmt.Sprintf("mr-%s-%d", reply.InputPhaseUUID, reply.BucketID))
 
+	readStart := time.Now()
 	f, err := os.Open(inPath)
 	if err != nil {
 		return fmt.Errorf("sink bucket %d: open %s: %w", reply.BucketID, inPath, err)
@@ -238,6 +285,7 @@ func (c *Compacter) sinkErr() error {
 			kvs = append(kvs, KeyValue{Key: Key(parts[0]), Value: parts[1]})
 		}
 	}
+	fileReadMs := time.Since(readStart).Milliseconds()
 
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
@@ -252,6 +300,7 @@ func (c *Compacter) sinkErr() error {
 		collName = "output"
 	}
 
+	mongoStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -273,9 +322,18 @@ func (c *Compacter) sinkErr() error {
 			return fmt.Errorf("sink bucket %d: upsert key %q: %w", reply.BucketID, kv.Key, err)
 		}
 	}
+	mongoWriteMs := time.Since(mongoStart).Milliseconds()
 
-	fmt.Printf("[compacter %d] sink bucket %d → upserted %d records to %s.%s\n",
-		c.ID, reply.BucketID, len(kvs), dbName, collName)
+	c.store.MarkSinkDone(reply.PhaseUUID, reply.BucketID, len(kvs), dbName, collName)
+
+	M(txnID(reply), "sink_task").
+		Set("bucket_id", reply.BucketID).
+		Set("total_latency_ms", time.Since(totalStart).Milliseconds()).
+		Set("file_read_ms", fileReadMs).
+		Set("mongo_write_ms", mongoWriteMs).
+		Set("records_written", len(kvs)).
+		Set("success", true).
+		Emit()
 	return nil
 }
 

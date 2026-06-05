@@ -22,6 +22,26 @@ type Worker struct {
 	lastErr         error
 }
 
+// outDir returns the directory where this task writes its output files.
+// Path: <outputDir>/<jobID>/<actionDir>/ when job-scoped; falls back to
+// outputDir for embedded single-node mode (no JobID).
+func (w *Worker) outDir(r *MessageReply) string {
+	if r.JobID == "" {
+		return w.outputDir
+	}
+	dir := filepath.Join(w.outputDir, r.JobID, actionDir(r.ActionType))
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// inDir returns the directory where this task reads its input files.
+func (w *Worker) inDir(r *MessageReply) string {
+	if r.JobID == "" {
+		return w.outputDir
+	}
+	return filepath.Join(w.outputDir, r.JobID, actionDir(r.InputActionType))
+}
+
 // dial returns an RPC client connected to the coordinator.
 func (w *Worker) dial() (*rpc.Client, error) {
 	if w.coordinatorAddr != "" {
@@ -126,46 +146,50 @@ func (w *Worker) runMap(pf *PluginFuncs) {
 	if err := w.mapErr(pf); err != nil {
 		w.lastErr = err
 		reply := w.activeReply
-		fmt.Printf("[worker %d] map/filter task %d failed: %v\n", w.ID, reply.TaskID, err)
+		M(txnID(reply), "map_task").
+			Set("chunk_id", reply.ChunkID).
+			Set("file_name", reply.FileName).
+			Set("success", false).
+			EmitError(err)
 		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
 	}
 }
 
 func (w *Worker) mapErr(pf *PluginFuncs) error {
 	reply := w.activeReply
+	totalStart := time.Now()
+	outD := w.outDir(reply)
 
-	// Checkpoint: skip if output files for this stage+chunk already exist.
-	checkpointGlob := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-s%d-%s-*", reply.StageIdx, reply.ChunkID))
+	// Checkpoint: skip if output files for this phase+chunk already exist.
+	checkpointGlob := filepath.Join(outD, fmt.Sprintf("mr-%s-%s-*", reply.PhaseUUID, reply.ChunkID))
 	if existing, _ := filepath.Glob(checkpointGlob); len(existing) > 0 {
-		fmt.Printf("[worker %d] stage %d map %s: checkpoint found, skipping\n",
-			w.ID, reply.StageIdx, reply.ChunkID)
+		appLog(txnID(reply), "INFO", fmt.Sprintf("map chunk=%s checkpoint found, skipping", reply.ChunkID))
 		return nil
 	}
 
 	// Fetch input content.
+	fetchStart := time.Now()
 	var filename string
 	var content []byte
 	var err error
 	if reply.StageIdx == 0 {
-		// Stage 0: raw chunk bytes from coordinator.
 		content, err = w.getChunk(reply.ChunkID)
 		if err != nil {
 			return fmt.Errorf("fetch chunk %s: %w", reply.ChunkID, err)
 		}
 		filename = reply.FileName
 	} else {
-		// Stage N>0: read previous stage's intermediate files for this chunk.
-		pattern := filepath.Join(w.outputDir,
-			fmt.Sprintf("mr-s%d-%s-*", reply.InputStageIdx, reply.ChunkID))
+		pattern := filepath.Join(w.inDir(reply),
+			fmt.Sprintf("mr-%s-%s-*", reply.InputPhaseUUID, reply.ChunkID))
 		content, err = readFilesConcat(pattern)
 		if err != nil {
-			return fmt.Errorf("read stage %d intermediates for chunk %s: %w",
-				reply.InputStageIdx, reply.ChunkID, err)
+			return fmt.Errorf("read input stage intermediates for chunk %s: %w", reply.ChunkID, err)
 		}
 		filename = reply.ChunkID
 	}
+	chunkFetchMs := time.Since(fetchStart).Milliseconds()
 
+	processStart := time.Now()
 	result := pf.Map(filename, string(content))
 	kvs, ok := result.([]KeyValue)
 	if !ok {
@@ -179,10 +203,10 @@ func (w *Worker) mapErr(pf *PluginFuncs) error {
 		bucket, _ := ring.GetNode(string(kv.Key))
 		bucketKVs[bucket] = append(bucketKVs[bucket], kv)
 	}
+	processMs := time.Since(processStart).Milliseconds()
 
 	for bucket, bkvs := range bucketKVs {
-		path := filepath.Join(w.outputDir,
-			fmt.Sprintf("mr-s%d-%s-%s", reply.StageIdx, reply.ChunkID, bucket))
+		path := filepath.Join(outD, fmt.Sprintf("mr-%s-%s-%s", reply.PhaseUUID, reply.ChunkID, bucket))
 		out, err := os.Create(path)
 		if err != nil {
 			return err
@@ -197,40 +221,53 @@ func (w *Worker) mapErr(pf *PluginFuncs) error {
 		out.Close()
 	}
 
-	fmt.Printf("[worker %d] stage %d map %s (%s) → %d kvs across %d buckets\n",
-		w.ID, reply.StageIdx, reply.FileName, reply.ChunkID, len(kvs), len(bucketKVs))
+	M(txnID(reply), "map_task").
+		Set("chunk_id", reply.ChunkID).
+		Set("file_name", reply.FileName).
+		Set("total_latency_ms", time.Since(totalStart).Milliseconds()).
+		Set("chunk_fetch_ms", chunkFetchMs).
+		Set("process_ms", processMs).
+		Set("kvs_produced", len(kvs)).
+		Set("buckets_written", len(bucketKVs)).
+		Set("success", true).
+		Emit()
 	return nil
 }
 
-// runReduce handles Reduce, GroupBy, SelectKey. One task per bucket, reads across all chunks.
+// runReduce handles Reduce. One task per bucket, reads across all chunks.
 func (w *Worker) runReduce(pf *PluginFuncs) {
 	if err := w.reduceErr(pf); err != nil {
 		w.lastErr = err
 		reply := w.activeReply
-		fmt.Printf("[worker %d] reduce/groupby bucket %d failed: %v\n", w.ID, reply.BucketID, err)
+		M(txnID(reply), "reduce_task").
+			Set("bucket_id", reply.BucketID).
+			Set("success", false).
+			EmitError(err)
 		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
 	}
 }
 
 func (w *Worker) reduceErr(pf *PluginFuncs) error {
 	reply := w.activeReply
-	outPath := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-out-s%d-%d", reply.StageIdx, reply.BucketID))
+	totalStart := time.Now()
+	outD := w.outDir(reply)
+	outPath := filepath.Join(outD, fmt.Sprintf("mr-%s-%d", reply.PhaseUUID, reply.BucketID))
 
 	if _, err := os.Stat(outPath); err == nil {
-		fmt.Printf("[worker %d] stage %d reduce bucket %d: checkpoint found, skipping\n",
-			w.ID, reply.StageIdx, reply.BucketID)
+		appLog(txnID(reply), "INFO", fmt.Sprintf("reduce bucket=%d checkpoint found, skipping", reply.BucketID))
 		return nil
 	}
 
-	// Read ALL map outputs for this bucket, across every chunk.
-	pattern := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-s%d-*-%d", reply.InputStageIdx, reply.BucketID))
+	globStart := time.Now()
+	pattern := filepath.Join(w.inDir(reply),
+		fmt.Sprintf("mr-%s-*-%d", reply.InputPhaseUUID, reply.BucketID))
 	files, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
 	}
+	globMs := time.Since(globStart).Milliseconds()
 
+	processStart := time.Now()
 	var intermediate []KeyValue
 	for _, fname := range files {
 		f, err := os.Open(fname)
@@ -249,13 +286,16 @@ func (w *Worker) reduceErr(pf *PluginFuncs) error {
 	}
 
 	sort.Slice(intermediate, func(i, j int) bool { return intermediate[i].Key < intermediate[j].Key })
+	processMs := time.Since(processStart).Milliseconds()
 
+	writeStart := time.Now()
 	ofile, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
 	defer ofile.Close()
 
+	keysWritten := 0
 	for i := 0; i < len(intermediate); {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
@@ -267,50 +307,58 @@ func (w *Worker) reduceErr(pf *PluginFuncs) error {
 		}
 		reduced := pf.Reduce(intermediate[i].Key, values)
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, reduced)
+		keysWritten++
 		i = j
 	}
+	fileWriteMs := time.Since(writeStart).Milliseconds()
 
-	fmt.Printf("[worker %d] stage %d reduce bucket %d → %s\n",
-		w.ID, reply.StageIdx, reply.BucketID, outPath)
+	M(txnID(reply), "reduce_task").
+		Set("bucket_id", reply.BucketID).
+		Set("total_latency_ms", time.Since(totalStart).Milliseconds()).
+		Set("files_glob_ms", globMs).
+		Set("process_ms", processMs).
+		Set("file_write_ms", fileWriteMs).
+		Set("keys_read", len(intermediate)).
+		Set("keys_written", keysWritten).
+		Set("success", true).
+		Emit()
 	return nil
 }
 
-// runSink consolidates ALL reduce output files from the previous stage and upserts
-// each key→value pair into MongoDB.
-// Connection string: MONGO_URI env var (default: mongodb://localhost:27017).
-// Database: MONGO_DB (default: "pipeline").
-// Collection: MONGO_COLLECTION (default: "output").
 // runSelectKey re-keys records from a reduce output. Reads the previous stage's
 // reduce output for this bucket, calls plugin.Map(key, value) to assign new keys,
-// and re-buckets into mr-s<StageIdx>-<inputBucket>-<newBucket> intermediates so a
-// downstream Reduce can glob them with mr-s<N>-*-<newBucket>.
+// and re-buckets into intermediates so a downstream Reduce can glob them.
 func (w *Worker) runSelectKey(pf *PluginFuncs) {
 	if err := w.selectKeyErr(pf); err != nil {
 		w.lastErr = err
 		reply := w.activeReply
-		fmt.Printf("[worker %d] selectkey bucket %d failed: %v\n", w.ID, reply.BucketID, err)
+		M(txnID(reply), "selectkey_task").
+			Set("bucket_id", reply.BucketID).
+			Set("success", false).
+			EmitError(err)
 		w.CallForStatusReport(TaskFailed, reply.TaskID, reply.TaskName, reply.PhaseIdx)
 	}
 }
 
 func (w *Worker) selectKeyErr(pf *PluginFuncs) error {
 	reply := w.activeReply
+	totalStart := time.Now()
+	outD := w.outDir(reply)
 
-	checkpointGlob := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-s%d-%d-*", reply.StageIdx, reply.BucketID))
+	checkpointGlob := filepath.Join(outD, fmt.Sprintf("mr-%s-%d-*", reply.PhaseUUID, reply.BucketID))
 	if existing, _ := filepath.Glob(checkpointGlob); len(existing) > 0 {
-		fmt.Printf("[worker %d] stage %d selectkey bucket %d: checkpoint found, skipping\n",
-			w.ID, reply.StageIdx, reply.BucketID)
+		appLog(txnID(reply), "INFO", fmt.Sprintf("selectkey bucket=%d checkpoint found, skipping", reply.BucketID))
 		return nil
 	}
 
-	inPath := filepath.Join(w.outputDir,
-		fmt.Sprintf("mr-out-s%d-%d", reply.InputStageIdx, reply.BucketID))
+	inPath := filepath.Join(w.inDir(reply),
+		fmt.Sprintf("mr-%s-%d", reply.InputPhaseUUID, reply.BucketID))
 	kvs, err := readReduceOutput(inPath)
 	if err != nil {
 		return fmt.Errorf("selectkey: read %s: %w", inPath, err)
 	}
 
+	processStart := time.Now()
 	ring := buildRing(reply.NReduce)
 	bucketKVs := make(map[string][]KeyValue, reply.NReduce)
 	for _, kv := range kvs {
@@ -324,19 +372,27 @@ func (w *Worker) selectKeyErr(pf *PluginFuncs) error {
 			bucketKVs[bucket] = append(bucketKVs[bucket], nkv)
 		}
 	}
+	processMs := time.Since(processStart).Milliseconds()
 
-	// Sort each bucket by key before writing so downstream Reduce gets pre-sorted input.
+	writeStart := time.Now()
 	for bucket, bkvs := range bucketKVs {
 		sort.Slice(bkvs, func(i, j int) bool { return bkvs[i].Key < bkvs[j].Key })
-		path := filepath.Join(w.outputDir,
-			fmt.Sprintf("mr-s%d-%d-%s", reply.StageIdx, reply.BucketID, bucket))
+		path := filepath.Join(outD, fmt.Sprintf("mr-%s-%d-%s", reply.PhaseUUID, reply.BucketID, bucket))
 		if err := encodeKVs(path, bkvs); err != nil {
 			return err
 		}
 	}
+	fileWriteMs := time.Since(writeStart).Milliseconds()
 
-	fmt.Printf("[worker %d] stage %d selectkey bucket %d → %d new-key buckets\n",
-		w.ID, reply.StageIdx, reply.BucketID, len(bucketKVs))
+	M(txnID(reply), "selectkey_task").
+		Set("bucket_id", reply.BucketID).
+		Set("total_latency_ms", time.Since(totalStart).Milliseconds()).
+		Set("process_ms", processMs).
+		Set("file_write_ms", fileWriteMs).
+		Set("keys_read", len(kvs)).
+		Set("new_buckets", len(bucketKVs)).
+		Set("success", true).
+		Emit()
 	return nil
 }
 
@@ -373,4 +429,3 @@ func buildRing(nReduce int) *hashring.HashRing {
 	}
 	return hashring.New(nodes)
 }
-

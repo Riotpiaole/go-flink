@@ -162,6 +162,18 @@ func (p *Pipeline) Start() {
 	msgCh := p.Sources.StreamChunks(ctx)
 	coordinator := NewCoordinator(p.NReduce, p.Actions)
 
+	// Assign a stable job UUID so workers receive job-scoped file paths and
+	// MongoDB keys work correctly in embedded mode (matching SubmitJob behaviour).
+	jobID := uuid.New().String()
+	if err := coordinator.CompactedBucketStore.Connect(os.Getenv("MONGO_URI")); err != nil {
+		fmt.Printf("[pipeline] warning: MongoDB unavailable: %v\n", err)
+	}
+	coordinator.mu.Lock()
+	coordinator.jobID = jobID
+	coordinator.phaseUUIDs[0] = uuid.New().String()
+	coordinator.mu.Unlock()
+	coordinator.CompactedBucketStore.SetJobID(jobID)
+
 	if p.RPCAddr != "" {
 		if err := coordinator.ListenTCP(p.RPCAddr); err != nil {
 			panic("coordinator TCP listen: " + err.Error())

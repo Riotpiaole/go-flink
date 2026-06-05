@@ -29,6 +29,7 @@ type RaftCommand struct {
 	TaskID       int
 	ChunkID      string
 	PhaseIdx     int
+	PhaseUUID    string    // set for CmdAdvancePhase; uniquely identifies the new phase
 	NextOffset   int64
 	DispatchedAt time.Time // set for CmdDispatchTask; recorded in inFlight for timeout detection
 	Task         *TaskInfo // full task for EnqueueTask and CmdDispatchTask
@@ -39,6 +40,7 @@ type RaftCommand struct {
 // workers re-fetch chunks via GetChunk RPC.
 type raftSnapshot struct {
 	JobID         string
+	PhaseUUIDs    map[int]string // phaseIdx → UUID; drives file paths and MongoDB keys
 	PhaseIdx      int
 	PhaseDone     int
 	FailedTasks   int
@@ -111,9 +113,12 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 		c.phaseDone = 0
 		c.failedTasks = 0
 		c.inFlight = make(map[int]*TaskInfo)
+		if cmd.PhaseUUID != "" {
+			c.phaseUUIDs[c.phaseIdx] = cmd.PhaseUUID
+		}
 		// reduceDoneBuckets and compactDispatched are now persisted in MongoDB
 		// (CompactedBucketStore). Documents from the old phase are automatically
-		// invisible because keys are scoped by instanceID + phaseIdx.
+		// invisible because keys are scoped by jobID + phaseUUID.
 	}
 
 	return nil
@@ -145,8 +150,13 @@ func (c *Coordinator) Snapshot() (raft.FSMSnapshot, error) {
 		c.JobStatus.Enqueue(item)
 	}
 
+	phaseUUIDs := make(map[int]string, len(c.phaseUUIDs))
+	for k, v := range c.phaseUUIDs {
+		phaseUUIDs[k] = v
+	}
 	snap := &raftSnapshot{
-		JobID:         c.CompactedBucketStore.JobID(),
+		JobID:         c.jobID,
+		PhaseUUIDs:    phaseUUIDs,
 		PhaseIdx:      c.phaseIdx,
 		PhaseDone:     c.phaseDone,
 		FailedTasks:   c.failedTasks,
@@ -181,7 +191,11 @@ func (c *Coordinator) Restore(rc io.ReadCloser) error {
 	c.taskFiles = snap.TaskFiles
 	c.taskFileNames = snap.TaskFileNames
 	if snap.JobID != "" {
+		c.jobID = snap.JobID
 		c.CompactedBucketStore.SetJobID(snap.JobID)
+	}
+	if snap.PhaseUUIDs != nil {
+		c.phaseUUIDs = snap.PhaseUUIDs
 	}
 
 	// Rebuild the priority queue from the snapshot task list.
