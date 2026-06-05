@@ -25,27 +25,29 @@ const (
 
 // RaftCommand is JSON-encoded and stored in the Raft log.
 type RaftCommand struct {
-	Type       RaftCommandType
-	TaskID     int
-	ChunkID    string
-	PhaseIdx   int
-	NextOffset int64
-	Task       *TaskInfo // full task for EnqueueTask
+	Type         RaftCommandType
+	TaskID       int
+	ChunkID      string
+	PhaseIdx     int
+	NextOffset   int64
+	DispatchedAt time.Time // set for CmdDispatchTask; recorded in inFlight for timeout detection
+	Task         *TaskInfo // full task for EnqueueTask and CmdDispatchTask
 }
 
 // raftSnapshot captures the coordinator state for log compaction.
 // chunkStore is intentionally excluded — raw bytes are too large and
 // workers re-fetch chunks via GetChunk RPC.
 type raftSnapshot struct {
-	PhaseIdx    int
-	PhaseDone   int
-	FailedTasks int
-	NumTasks    int
-	SourceDone  bool
-	InFlight    map[int]*TaskInfo
-	TaskFiles   map[int]string
+	JobID         string
+	PhaseIdx      int
+	PhaseDone     int
+	FailedTasks   int
+	NumTasks      int
+	SourceDone    bool
+	InFlight      map[int]*TaskInfo
+	TaskFiles     map[int]string
 	TaskFileNames map[int]string
-	Tasks       []*TaskInfo // queue contents at snapshot time
+	Tasks         []*TaskInfo // queue contents at snapshot time
 }
 
 // Apply implements raft.FSM. Called on every node when a log entry commits.
@@ -71,8 +73,13 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 		}
 
 	case CmdDispatchTask:
-		if task, ok := c.inFlight[cmd.TaskID]; ok {
-			task.DispatchedAt = time.Now()
+		if cmd.Task != nil {
+			cmd.Task.DispatchedAt = cmd.DispatchedAt
+			c.inFlight[cmd.Task.TaskId] = cmd.Task
+			// On WAL replay a task may still be in the PQ (enqueued before crash,
+			// dequeued by the old leader but not yet snapshotted). Remove it so
+			// the restored queue doesn't re-dispatch it.
+			c.removeFromQueue(cmd.Task.TaskId)
 		}
 
 	case CmdCompleteTask:
@@ -104,8 +111,9 @@ func (c *Coordinator) Apply(l *raft.Log) interface{} {
 		c.phaseDone = 0
 		c.failedTasks = 0
 		c.inFlight = make(map[int]*TaskInfo)
-		c.reduceDoneBuckets = make(map[int]bool)
-		c.compactDispatched = make(map[int]bool)
+		// reduceDoneBuckets and compactDispatched are now persisted in MongoDB
+		// (CompactedBucketStore). Documents from the old phase are automatically
+		// invisible because keys are scoped by instanceID + phaseIdx.
 	}
 
 	return nil
@@ -138,6 +146,7 @@ func (c *Coordinator) Snapshot() (raft.FSMSnapshot, error) {
 	}
 
 	snap := &raftSnapshot{
+		JobID:         c.CompactedBucketStore.JobID(),
 		PhaseIdx:      c.phaseIdx,
 		PhaseDone:     c.phaseDone,
 		FailedTasks:   c.failedTasks,
@@ -171,6 +180,9 @@ func (c *Coordinator) Restore(rc io.ReadCloser) error {
 	c.inFlight = snap.InFlight
 	c.taskFiles = snap.TaskFiles
 	c.taskFileNames = snap.TaskFileNames
+	if snap.JobID != "" {
+		c.CompactedBucketStore.SetJobID(snap.JobID)
+	}
 
 	// Rebuild the priority queue from the snapshot task list.
 	c.JobStatus = pq.NewWith(byPriority)

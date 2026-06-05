@@ -36,6 +36,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        - name: MONGO_URI
+          valueFrom:
+            secretKeyRef:
+              name: pipeline-secrets
+              key: mongo-uri
+              optional: true
         ports:
         - name: raft
           containerPort: 7000

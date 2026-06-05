@@ -52,6 +52,7 @@ type MessageReply struct {
 	TaskName    string // file path for phase 0 (map)
 	FileName    string // base file name of the source chunk
 	ChunkID     string // UUID identifying this specific file chunk
+	JobID       string // UUID of the pipeline job; used to scope output directories and MongoDB keys
 	BucketID    int    // partition index for reduce/groupby stages
 	ActionIndex int    // kept for backward compatibility; prefer StageIdx
 	PhaseIdx     int    // coordinator's current phaseIdx at dispatch time
