@@ -10,6 +10,7 @@ A distributed MapReduce pipeline engine written in Go. Processing stages run as 
 | Distributed cluster | `go-flink node` | Multi-node Kubernetes deployment via Raft |
 | Remote submission | `go-flink submit` | Send a job to a running cluster |
 | Worker-only | `go-flink worker` | Attach additional workers to an existing coordinator |
+| Compacter-only | `go-flink compacter` | Attach additional compacters (GroupBy / Sink) to an existing coordinator |
 
 ---
 
@@ -48,7 +49,7 @@ Workers register automatically by polling the coordinator's Unix socket. Add or 
 
 ## Distributed cluster
 
-Every node runs the same binary. Raft elects one leader (coordinator); others act as workers.
+Every node runs the same binary. Raft elects one leader (coordinator); others act as workers. Each node also co-locates one compacter goroutine by default (`--compacters 1`).
 
 ```bash
 # Node 0
@@ -59,7 +60,8 @@ Every node runs the same binary. Raft elects one leader (coordinator); others ac
   --raft-peers "node-0.go-flink:7000=node-0.go-flink:8000,node-1.go-flink:7000=node-1.go-flink:8000,node-2.go-flink:7000=node-2.go-flink:8000" \
   --bind :8000 \
   --plugin-dir /plugins \
-  --data-dir /data/raft
+  --data-dir /data/raft \
+  --compacters 1
 
 # Node 1, Node 2 — same flags, different --node-id and addresses
 ```
@@ -92,7 +94,9 @@ kubectl apply -f k8s/output-pvc-minikube.yaml \
               -f k8s/headless-service.yaml \
               -f k8s/rpc-service.yaml \
               -f k8s/statefulset.yaml \
-              -f k8s/worker-deployment.yaml
+              -f k8s/worker-deployment.yaml \
+              -f k8s/compacter-deployment.yaml \
+              -f k8s/kafka.yaml
 
 # Wait for cluster to elect a leader
 kubectl rollout status statefulset/go-flink
@@ -133,12 +137,18 @@ pipeline.NewPipeline(&ds).
     Map("tokenizer").
     Map("normalizer").
     Reduce("word_count").
+    GroupBy("word_count").   // reactive compaction: starts per bucket as Reduce finishes
     Sink("file_sink").
-    Start()           // embedded single-node
+    Start()                  // embedded single-node
     // or .Submit("coordinator:8000") for cluster
 ```
 
 Each stage names a plugin. Stages chain through intermediate files automatically.
+
+Stage ordering rules:
+- `GroupBy` must immediately follow `Reduce`
+- `GroupBy` + `Sink` tasks are routed to the Compacter pool
+- `Map`, `Filter`, `Reduce`, `SelectKey` tasks are routed to the Worker pool
 
 ---
 
@@ -160,15 +170,22 @@ go-flink worker
     --id <int>             worker ID                                   [default: PID]
     -o <dir>               output directory
 
-go-flink node
-    --node-id <string>     unique identifier                           [default: hostname]
-    --raft-bind <addr>     TCP listen address for Raft transport       [default: :7000]
-    --raft-advertise <addr> address peers use to reach this node
-    --raft-peers <list>    comma-separated raftAddr=rpcAddr pairs
-    --bind <addr>          TCP listen address for worker/submit RPC    [default: :8000]
-    --data-dir <dir>       Raft WAL + snapshot directory               [default: ./raft-data]
+go-flink compacter
     --plugin-dir <dir>     .so plugin directory                        [default: ./plugins]
+    --coordinator <addr>   coordinator host:port (empty = Unix socket)
+    --id <int>             compacter ID                                [default: PID]
     -o <dir>               output directory
+
+go-flink node
+    --node-id <string>      unique identifier                          [default: hostname]
+    --raft-bind <addr>      TCP listen address for Raft transport      [default: :7000]
+    --raft-advertise <addr> address peers use to reach this node
+    --raft-peers <list>     comma-separated raftAddr=rpcAddr pairs
+    --bind <addr>           TCP listen address for worker/submit RPC   [default: :8000]
+    --data-dir <dir>        Raft WAL + snapshot directory              [default: ./raft-data]
+    --plugin-dir <dir>      .so plugin directory                       [default: ./plugins]
+    --compacters <int>      compacter goroutines to co-locate          [default: 1]
+    -o <dir>                output directory
 
 go-flink submit
     --cluster <addr>       coordinator host:port                       [required]
@@ -184,10 +201,13 @@ go-flink submit
 
 ## Intermediate file naming
 
-| Stage type | Pattern written | Pattern read by next stage |
+| Stage type | Pattern written | Read by |
 |---|---|---|
-| Map / Filter | `mr-s<N>-<chunkID>-<bucket>` | next Map/Filter reads `mr-s<N>-<chunkID>-*` |
-| Reduce / GroupBy | `mr-out-s<N>-<bucket>` | Sink reads `mr-out-s<N>-*` |
+| Map / Filter | `mr-s<N>-<chunkID>-<bucket>` | next Reduce stage (`mr-s<N>-*-<bucket>`) |
+| Reduce | `mr-out-s<N>-<bucket>` | GroupBy or Sink |
+| SelectKey | `mr-s<N>-<inBucket>-<newBucket>` | next Reduce stage |
+| GroupBy | `mr-out-<bucket>` (no stage index) | Sink |
+| Sink | → MongoDB | — |
 
 The stage index `N` is embedded in filenames so multi-stage pipelines never collide.
 

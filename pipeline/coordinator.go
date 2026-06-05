@@ -101,9 +101,9 @@ type Coordinator struct {
 	raftNode *raft.Raft
 
 	// Fields used by the unified node model (StartWithRaft).
-	myRPCAddr      string                          // this node's TCP RPC address (e.g. ":8000")
-	peerRPCAddrs   map[raft.ServerAddress]string   // raftAddr → rpcAddr for follower→leader routing
-	workerRegistry *PluginRegistry
+	myRPCAddr       string                        // this node's TCP RPC address (e.g. ":8000")
+	peerRPCAddrs    map[raft.ServerAddress]string // raftAddr → rpcAddr for follower→leader routing
+	workerRegistry  *PluginRegistry
 	workerOutputDir string
 }
 
